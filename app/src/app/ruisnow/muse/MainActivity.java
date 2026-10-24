@@ -84,14 +84,22 @@ public class MainActivity extends Activity {
         devIdView.setPadding(0, 4, 0, 12);
         root.addView(devIdView);
 
-        serviceToggleBtn = btn(BridgeService.isRunning ? "停止服务" : "启动服务", new View.OnClickListener() {
+        serviceToggleBtn = btn(BridgeService.isRunning ? "停止服务" : "保存配对并启动服务", new View.OnClickListener() {
             @Override public void onClick(View v) {
                 if (BridgeService.isRunning) {
                     Prefs.setUserStopped(MainActivity.this, true);
                     stopService(new Intent(MainActivity.this, BridgeService.class));
                     toast("服务已停止");
                 } else {
+                    android.content.SharedPreferences.Editor ed = Prefs.sp(MainActivity.this).edit()
+                            .putString("base_url", urlEdit.getText().toString().trim())
+                            .putString("token", tokenEdit.getText().toString().trim());
+                    String pin = pinEdit.getText().toString().trim();
+                    if (pin.length() > 0) ed.putString("unlock_pin", pin);
+                    else ed.remove("unlock_pin");
+                    ed.apply();
                     startBridge();
+                    toast("已保存配对，服务启动中");
                 }
                 refresh();
             }
@@ -114,22 +122,6 @@ public class MainActivity extends Activity {
                 | android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD);
         pinEdit.setTransformationMethod(android.text.method.PasswordTransformationMethod.getInstance());
         root.addView(pinEdit);
-
-        Button savePairBtn = btn("保存配对并启动服务", new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                android.content.SharedPreferences.Editor ed = Prefs.sp(MainActivity.this).edit()
-                        .putString("base_url", urlEdit.getText().toString().trim())
-                        .putString("token", tokenEdit.getText().toString().trim());
-                String pin = pinEdit.getText().toString().trim();
-                if (pin.length() > 0) ed.putString("unlock_pin", pin);
-                else ed.remove("unlock_pin");
-                ed.apply();
-                startBridge();
-                toast("已保存，服务启动中");
-                refresh();
-            }
-        });
-        root.addView(savePairBtn);
 
         LinearLayout row2 = row();
         filePermBtn = btn("文件权限", new View.OnClickListener() {
@@ -354,7 +346,7 @@ public class MainActivity extends Activity {
 
     private void refreshInner() {
         if (serviceToggleBtn != null) {
-            serviceToggleBtn.setText(BridgeService.isRunning ? "停止服务" : "启动服务");
+            serviceToggleBtn.setText(BridgeService.isRunning ? "停止服务" : "保存配对并启动服务");
         }
 
         boolean storageGranted = Build.VERSION.SDK_INT < 23
