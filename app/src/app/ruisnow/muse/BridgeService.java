@@ -123,6 +123,7 @@ public class BridgeService extends Service {
     private volatile String lastNotifText = null;
 
     private void setNotificationText(String text) {
+        if (!isRunning) return;
         if (text.equals(lastNotifText)) return;
         lastNotifText = text;
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
@@ -357,6 +358,26 @@ public class BridgeService extends Service {
             try { wm.removeView(ball); } catch (Exception ignored) {}
         }
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        // Replace whatever live state was showing (often "连接中断，重连中…",
+        // posted by the dying worker) with a final, dismissible stopped
+        // notice; the isRunning guard keeps the worker from overwriting it.
+        try {
+            stopForeground(true);
+            Intent open = new Intent(this, MainActivity.class);
+            PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+                    PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                    ? new Notification.Builder(this, CHANNEL)
+                    : new Notification.Builder(this);
+            Notification stopped = b.setContentTitle("Muse 壳")
+                    .setContentText("已停止")
+                    .setSmallIcon(R.drawable.ic_stat_muse)
+                    .setContentIntent(pi)
+                    .setOngoing(false)
+                    .setAutoCancel(true)
+                    .build();
+            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(1, stopped);
+        } catch (Exception ignored) {}
         try { Ledger.log(this, "service_stop", null); } catch (Exception ignored) {}
         // Unexpected death (system kill): ask the watchdog for a fast comeback.
         // A deliberate stop sets userStopped first, so this stays quiet then;
