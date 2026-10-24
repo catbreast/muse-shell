@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Notification small icon (0.7.1): concentric rings — the shell's
+     launcher motif — drawn as an alpha mask; the system tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M12,2.6 A9.4,9.4 0 1,1 12,21.4 A9.4,9.4 0 1,1 12,2.6 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M12,8.8 A3.2,3.2 0 1,1 12,15.2 A3.2,3.2 0 1,1 12,8.8 Z"
+        android:fillColor="#FFFFFF" />
+</vector>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Muse 壳</string>
+    <string name="a11y_name">Muse 壳屏幕助手</string>
+    <string name="a11y_desc">让 Muse 读取屏幕控件并执行点击、输入、滚动与截图。仅在你主动开启并保持连接时工作，急停开关可立即停用。</string>
+</resources>

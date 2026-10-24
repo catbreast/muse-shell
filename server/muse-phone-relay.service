@@ -1,0 +1,15 @@
+[Unit]
+Description=Muse Shell phone relay (127.0.0.1:8390)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/muse-android-shell/server
+ExecStart=/usr/bin/python3 /home/hatch/workspace/muse-android-shell/server/server.py
+Restart=always
+RestartSec=2
+StandardOutput=append:/home/hatch/workspace/muse-android-shell/server/server.log
+StandardError=append:/home/hatch/workspace/muse-android-shell/server/server.log
+
+[Install]
+WantedBy=multi-user.target

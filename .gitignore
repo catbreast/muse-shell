@@ -1,0 +1,26 @@
+# 凭据与签名材料：永不入库
+.ks-pass
+muse-shell.keystore
+*.keystore
+.env
+.env.*
+# 构建时生成的密钥文件（build.sh 生成，文件头注明 do not commit）
+app/src/app/ruisnow/muse/hook/RelaySecret.java
+# 构建产物与工具链
+build/
+toolchain/
+*.apk
+*.idsig
+# 本地备份与杂物
+backups/
+__pycache__/
+*.log
+*.jpg
+.wrangler/
+.dev.vars
+.dev.vars.*
+# 依赖与虚拟环境（可重建，不入库）
+node_modules/
+ocr-venv/
+.venv/
+cf-relay/.cloudflare/
