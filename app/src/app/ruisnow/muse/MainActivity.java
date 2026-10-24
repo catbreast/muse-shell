@@ -102,6 +102,16 @@ public class MainActivity extends Activity {
                     toast("已保存配对，服务启动中");
                 }
                 refresh();
+                // startForegroundService is async: isRunning flips only when
+                // the service's onCreate runs, so an immediate refresh still
+                // reads the old state. Re-check shortly after to flip the
+                // button label to match the service's real state.
+                serviceToggleBtn.postDelayed(new Runnable() {
+                    @Override public void run() { refresh(); }
+                }, 800);
+                serviceToggleBtn.postDelayed(new Runnable() {
+                    @Override public void run() { refresh(); }
+                }, 2000);
             }
         });
         root.addView(serviceToggleBtn);
