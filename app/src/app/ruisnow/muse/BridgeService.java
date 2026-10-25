@@ -35,8 +35,6 @@ public class BridgeService extends Service {
     // a dispatch, so the supervisor must not read that silence as a wedge.
     static volatile boolean dispatching = false;
     private Thread supervisor;
-    private WindowManager wm;
-    private View ball;
     private PowerManager.WakeLock wakeLock;
 
     public static boolean isRunning() {
@@ -98,12 +96,13 @@ public class BridgeService extends Service {
         wakeLock.acquire();
         lastPollOkMs = System.currentTimeMillis();
         startSupervisor();
-        attachBall();
         try {
             Ledger.log(this, "service_start", null);
         } catch (Exception ignored) {
         }
     }
+
+    private static final String ACTION_TOGGLE_KILL = "app.ruisnow.muse.TOGGLE_KILL";
 
     private Notification buildNotification(String text) {
         Intent open = new Intent(this, MainActivity.class);
@@ -112,6 +111,19 @@ public class BridgeService extends Service {
         Notification.Builder b = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL)
                 : new Notification.Builder(this);
+        // VPN-style stop action in the persistent notification: the floating
+        // ball is gone, so the kill switch lives here now. The label flips
+        // with the current state; the notification is rebuilt on every post,
+        // so the label stays truthful.
+        boolean killed = Prefs.killSwitch(this);
+        Intent toggle = new Intent(this, BridgeService.class);
+        toggle.setAction(ACTION_TOGGLE_KILL);
+        PendingIntent tpi = PendingIntent.getService(this, 1, toggle,
+                PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+        b.addAction(new Notification.Action.Builder(
+                android.R.drawable.ic_lock_power_off,
+                killed ? "解除急停" : "急停",
+                tpi).build());
         return b.setContentTitle("Muse 壳")
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_stat_muse)
@@ -132,6 +144,19 @@ public class BridgeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_TOGGLE_KILL.equals(intent.getAction())) {
+            boolean on = !Prefs.killSwitch(this);
+            Prefs.setKillSwitch(this, on);
+            Toast.makeText(this, on ? "急停已开启" : "急停已关闭", Toast.LENGTH_SHORT).show();
+            try {
+                Ledger.log(this, on ? "kill_on" : "kill_off", null);
+            } catch (Exception ignored) {}
+            // Force a repost so the action label flips to the new state.
+            String t = lastNotifText != null ? lastNotifText : "已连接";
+            lastNotifText = null;
+            setNotificationText(t);
+            return START_STICKY;
+        }
         // Liveness is judged by the thread itself, not the running flag: if the
         // worker died (Error, freeze-kill) while the flag stayed set, a plain
         // "start service" tap must still be able to revive it.
@@ -279,96 +304,11 @@ public class BridgeService extends Service {
         supervisor.start();
     }
 
-    // ---------- floating ball: tap opens Muse app, long-press toggles kill switch ----------
-
-    private void attachBall() {
-        try {
-            if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) return;
-            wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-            final TextView tv = new TextView(this);
-            tv.setText("M");
-            tv.setTextColor(Color.WHITE);
-            tv.setTextSize(18);
-            tv.setGravity(Gravity.CENTER);
-            android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
-            gd.setShape(android.graphics.drawable.GradientDrawable.OVAL);
-            gd.setColor(0xCC2962FF);
-            tv.setBackground(gd);
-            int size = 120;
-            final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                    size, size,
-                    Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                    PixelFormat.TRANSLUCENT);
-            lp.gravity = Gravity.TOP | Gravity.END;
-            lp.x = 24;
-            lp.y = 240;
-            tv.setOnTouchListener(new View.OnTouchListener() {
-                private int startX, startY;
-                private float touchX, touchY;
-                private long downAt;
-                private boolean longFired;
-
-                @Override
-                public boolean onTouch(View v, MotionEvent e) {
-                    switch (e.getAction()) {
-                        case MotionEvent.ACTION_DOWN:
-                            startX = lp.x;
-                            startY = lp.y;
-                            touchX = e.getRawX();
-                            touchY = e.getRawY();
-                            downAt = System.currentTimeMillis();
-                            break;
-                        case MotionEvent.ACTION_MOVE:
-                            lp.x = startX - (int) (e.getRawX() - touchX);
-                            lp.y = startY + (int) (e.getRawY() - touchY);
-                            try { wm.updateViewLayout(tv, lp); } catch (Exception ignored) {}
-                            break;
-                        case MotionEvent.ACTION_UP:
-                            long held = System.currentTimeMillis() - downAt;
-                            int moved = Math.abs((int) (e.getRawX() - touchX))
-                                    + Math.abs((int) (e.getRawY() - touchY));
-                            if (held >= 800 && moved < 20) {
-                                boolean on = !Prefs.killSwitch(BridgeService.this);
-                                Prefs.setKillSwitch(BridgeService.this, on);
-                                Toast.makeText(BridgeService.this,
-                                        on ? "急停已开启" : "急停已关闭", Toast.LENGTH_SHORT).show();
-                            } else if (moved < 20) {
-                                boolean launched = false;
-                                try {
-                                    Intent open = getPackageManager()
-                                            .getLaunchIntentForPackage("com.facebook.aura");
-                                    if (open != null) {
-                                        open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                                        startActivity(open);
-                                        launched = true;
-                                    }
-                                } catch (Exception ignored) {}
-                                if (!launched) {
-                                    Intent console = new Intent(BridgeService.this, MainActivity.class);
-                                    console.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                                    startActivity(console);
-                                }
-                            }
-                            break;
-                    }
-                    return true;
-                }
-            });
-            ball = tv;
-            wm.addView(tv, lp);
-        } catch (Exception ignored) {
-        }
-    }
-
     @Override
     public void onDestroy() {
         isRunning = false;
         running = false;
         if (worker != null) worker.interrupt();
-        if (wm != null && ball != null) {
-            try { wm.removeView(ball); } catch (Exception ignored) {}
-        }
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         // Replace whatever live state was showing (often "连接中断，重连中…",
         // posted by the dying worker) with a final, dismissible stopped
