@@ -37,6 +37,15 @@ public class Prefs {
         sp(c).edit().putBoolean("kill_switch", on).apply();
     }
 
+    /** Press-and-hold the screen for 0.5s to open Muse. Default ON. */
+    public static boolean longPressMuse(Context c) {
+        return sp(c).getBoolean("long_press_muse", true);
+    }
+
+    public static void setLongPressMuse(Context c, boolean on) {
+        sp(c).edit().putBoolean("long_press_muse", on).apply();
+    }
+
     /** Auto-connect checkbox: boot autostart + watchdog resurrection. Default ON
      *  (preserves the pre-0.4.8 behavior where boot autostart was unconditional). */
     public static boolean autoConnect(Context c) {

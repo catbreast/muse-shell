@@ -5,14 +5,20 @@ import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Base64;
+import android.view.InputDevice;
+import android.view.MotionEvent;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.accessibilityservice.AccessibilityServiceInfo;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -29,6 +35,75 @@ public class ShellA11yService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
+        // Android 14+ 允许无障碍服务被动观察触摸事件（不拦截、不影响原应用），
+        // 用于「按住屏幕 0.5 秒打开 Muse」。低版本无此能力，静默跳过。
+        if (Build.VERSION.SDK_INT >= 34) {
+            try {
+                AccessibilityServiceInfo info = getServiceInfo();
+                if (info != null) {
+                    info.setMotionEventSources(InputDevice.SOURCE_TOUCHSCREEN);
+                    setServiceInfo(info);
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // ---------- 屏幕长按 0.5 秒打开 Muse ----------
+    // 状态机：DOWN 记起点并排 500ms 任务；MOVE 超过 24dp 视为滑动取消；
+    // UP/CANCEL/第二指按下取消；任务触发时手指仍按住原地 → 启动 aura，一次按下只触发一次。
+
+    private final Handler pressHandler = new Handler(Looper.getMainLooper());
+    private float pressX, pressY;
+    private boolean pressFired;
+    private final Runnable pressLaunch = new Runnable() {
+        @Override
+        public void run() {
+            pressFired = true;
+            try {
+                Intent open = getPackageManager().getLaunchIntentForPackage("com.facebook.aura");
+                if (open != null) {
+                    open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(open);
+                }
+            } catch (Exception ignored) {}
+        }
+    };
+
+    private void cancelPress() {
+        pressHandler.removeCallbacks(pressLaunch);
+    }
+
+    @Override
+    public void onMotionEvent(MotionEvent event) {
+        if (!Prefs.longPressMuse(this) || Prefs.killSwitch(this)) {
+            cancelPress();
+            return;
+        }
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                pressX = event.getRawX();
+                pressY = event.getRawY();
+                pressFired = false;
+                cancelPress();
+                pressHandler.postDelayed(pressLaunch, 500);
+                break;
+            case MotionEvent.ACTION_MOVE:
+                if (!pressFired) {
+                    float slop = 24f * getResources().getDisplayMetrics().density;
+                    if (Math.abs(event.getRawX() - pressX) > slop
+                            || Math.abs(event.getRawY() - pressY) > slop) {
+                        cancelPress();
+                    }
+                }
+                break;
+            case MotionEvent.ACTION_POINTER_DOWN:
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                cancelPress();
+                break;
+            default:
+                break;
+        }
     }
 
     @Override
@@ -41,6 +116,7 @@ public class ShellA11yService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+        cancelPress();
         if (instance == this) instance = null;
         super.onDestroy();
     }
