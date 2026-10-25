@@ -102,7 +102,30 @@ public class BridgeService extends Service {
         }
     }
 
-    private static final String ACTION_TOGGLE_KILL = "app.ruisnow.muse.TOGGLE_KILL";
+    private static final String ACTION_START = "app.ruisnow.muse.START";
+    private static final String ACTION_STOP = "app.ruisnow.muse.STOP";
+
+    /** Start/stop intents for the notification actions, mirroring the
+     *  console button's semantics exactly (Prefs.userStopped gates the
+     *  watchdog, so a notification stop is not resurrected either). */
+    private PendingIntent startPendingIntent(int requestCode) {
+        Intent start = new Intent(this, BridgeService.class);
+        start.setAction(ACTION_START);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+        if (Build.VERSION.SDK_INT >= 26) {
+            return PendingIntent.getForegroundService(this, requestCode, start, flags);
+        }
+        return PendingIntent.getService(this, requestCode, start, flags);
+    }
+
+    private PendingIntent stopPendingIntent(int requestCode) {
+        Intent stop = new Intent(this, BridgeService.class);
+        stop.setAction(ACTION_STOP);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+        return PendingIntent.getService(this, requestCode, stop, flags);
+    }
 
     private Notification buildNotification(String text) {
         Intent open = new Intent(this, MainActivity.class);
@@ -111,19 +134,10 @@ public class BridgeService extends Service {
         Notification.Builder b = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL)
                 : new Notification.Builder(this);
-        // VPN-style stop action in the persistent notification: the floating
-        // ball is gone, so the kill switch lives here now. The label flips
-        // with the current state; the notification is rebuilt on every post,
-        // so the label stays truthful.
-        boolean killed = Prefs.killSwitch(this);
-        Intent toggle = new Intent(this, BridgeService.class);
-        toggle.setAction(ACTION_TOGGLE_KILL);
-        PendingIntent tpi = PendingIntent.getService(this, 1, toggle,
-                PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
         b.addAction(new Notification.Action.Builder(
-                android.R.drawable.ic_lock_power_off,
-                killed ? "解除急停" : "急停",
-                tpi).build());
+                android.R.drawable.ic_media_play, "启动", startPendingIntent(1)).build());
+        b.addAction(new Notification.Action.Builder(
+                android.R.drawable.ic_lock_power_off, "停止", stopPendingIntent(2)).build());
         return b.setContentTitle("Muse 壳")
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_stat_muse)
@@ -144,18 +158,17 @@ public class BridgeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_TOGGLE_KILL.equals(intent.getAction())) {
-            boolean on = !Prefs.killSwitch(this);
-            Prefs.setKillSwitch(this, on);
-            Toast.makeText(this, on ? "急停已开启" : "急停已关闭", Toast.LENGTH_SHORT).show();
-            try {
-                Ledger.log(this, on ? "kill_on" : "kill_off", null);
-            } catch (Exception ignored) {}
-            // Force a repost so the action label flips to the new state.
-            String t = lastNotifText != null ? lastNotifText : "已连接";
-            lastNotifText = null;
-            setNotificationText(t);
+        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            // Same as the console stop: mark user-stopped so the watchdog
+            // does not resurrect the service, then shut down. onDestroy
+            // posts the stopped notice (which carries a 启动 action).
+            Prefs.setUserStopped(this, true);
+            Toast.makeText(this, "服务已停止", Toast.LENGTH_SHORT).show();
+            stopSelf();
             return START_STICKY;
+        }
+        if (intent != null && ACTION_START.equals(intent.getAction())) {
+            Prefs.setUserStopped(this, false);
         }
         // Liveness is judged by the thread itself, not the running flag: if the
         // worker died (Error, freeze-kill) while the flag stayed set, a plain
@@ -321,6 +334,8 @@ public class BridgeService extends Service {
             Notification.Builder b = Build.VERSION.SDK_INT >= 26
                     ? new Notification.Builder(this, CHANNEL)
                     : new Notification.Builder(this);
+            b.addAction(new Notification.Action.Builder(
+                    android.R.drawable.ic_media_play, "启动", startPendingIntent(3)).build());
             Notification stopped = b.setContentTitle("Muse 壳")
                     .setContentText("已停止")
                     .setSmallIcon(R.drawable.ic_stat_muse)
