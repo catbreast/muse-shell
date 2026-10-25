@@ -1,6 +1,7 @@
 package app.ruisnow.muse.hook;
 
 import android.app.Notification;
+import android.content.Intent;
 import android.os.Bundle;
 import android.os.Environment;
 import android.util.Log;
@@ -72,6 +73,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class BreenoHook extends XposedModule {
     private static final String TAG = "MuseHook";
     private static final String TARGET_PKG = "com.heytap.speechassist";
+    private static final String SPEECH_SERVICE = "com.heytap.speechassist.core.SpeechService";
     private static final String DATA_CENTER = "com.heytap.speechassist.aichat.AIChatDataCenter";
     private static final String VIEW_BEAN = "com.heytap.speechassist.aichat.bean.AIChatViewBean";
     private static final String MQM = "com.heytap.speech.engine.connect.core.manager.MessageQueueManager";
@@ -109,6 +111,8 @@ public class BreenoHook extends XposedModule {
     private volatile long lastTextTs = 0;
     private volatile long takeoverCacheTs = 0;
     private volatile boolean takeoverCache = true;
+    private volatile long powerCacheTs = 0;
+    private volatile boolean powerCache = true;
     private volatile boolean housekeeperStarted = false;
 
     @Override
@@ -136,11 +140,93 @@ public class BreenoHook extends XposedModule {
         } catch (Throwable t) {
             xlog("notification install failed: " + t);
         }
+        try {
+            installed += hookPowerKey(cl);
+        } catch (Throwable t) {
+            xlog("powerkey install failed: " + t);
+        }
         xlog("hooks installed=" + installed + " in " + param.getPackageName());
         startHousekeeper();
     }
 
     // ================= hooks =================
+
+    // ---- power key redirect (diagnostic phase: log SpeechService starts) ----
+    // ColorOS wakes Breeno on power long-press by starting SpeechService.
+    // Phase 1 records every start intent so the power-key signature can be
+    // identified from the module log; the redirect lands once it is known.
+    // Switch: /sdcard/MuseShell/powerkey_muse ("0" = off; absent or "1" = on).
+    private int hookPowerKey(ClassLoader cl) throws Exception {
+        Class<?> svc = Class.forName(SPEECH_SERVICE, false, cl);
+        int n = 0;
+        for (final Method m : svc.getDeclaredMethods()) {
+            if (!"onStartCommand".equals(m.getName())) continue;
+            Class<?>[] p = m.getParameterTypes();
+            if (m.getReturnType() != int.class || p.length != 3
+                    || p[0] != Intent.class || p[1] != int.class || p[2] != int.class) continue;
+            hook(m).intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    try {
+                        if (powerKeyOn()) {
+                            List<Object> a = chain.getArgs();
+                            Intent in = a.isEmpty() ? null : (Intent) a.get(0);
+                            appendFile("{\"event\":\"powerkey_start\",\"intent\":\""
+                                    + esc(describeIntent(in)) + "\"}");
+                        }
+                    } catch (Throwable ignored) {}
+                    return chain.proceed();
+                }
+            });
+            n++;
+        }
+        return n;
+    }
+
+    private static String describeIntent(Intent in) {
+        if (in == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        sb.append("action=").append(in.getAction());
+        sb.append(" cmp=").append(in.getComponent() == null
+                ? "-" : in.getComponent().flattenToShortString());
+        sb.append(" flags=0x").append(Integer.toHexString(in.getFlags()));
+        Bundle b = in.getExtras();
+        if (b != null) {
+            for (String k : b.keySet()) {
+                Object v = null;
+                try { v = b.get(k); } catch (Throwable ignored) {}
+                sb.append(" | ").append(k).append("=");
+                if (v == null) {
+                    sb.append("null");
+                } else if (v instanceof String || v instanceof Number || v instanceof Boolean) {
+                    String s = String.valueOf(v);
+                    sb.append(s.length() > 120 ? s.substring(0, 120) : s);
+                } else {
+                    sb.append("<").append(v.getClass().getSimpleName()).append(">");
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    private boolean powerKeyOn() {
+        long now = System.currentTimeMillis();
+        if (now - powerCacheTs < 5000) return powerCache;
+        powerCacheTs = now;
+        boolean on = true;
+        try {
+            File f = new File(Environment.getExternalStorageDirectory(), "MuseShell/powerkey_muse");
+            if (f.exists()) {
+                BufferedReader r = new BufferedReader(new FileReader(f));
+                String v = r.readLine();
+                r.close();
+                on = v == null || !"0".equals(v.trim());
+            }
+        } catch (Throwable ignored) {
+            on = true;
+        }
+        powerCache = on;
+        return on;
+    }
 
     private int hookDispatch(ClassLoader cl) throws Exception {
         Class<?> dc = Class.forName(DATA_CENTER, false, cl);
