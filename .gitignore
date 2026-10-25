@@ -24,3 +24,7 @@ node_modules/
 ocr-venv/
 .venv/
 cf-relay/.cloudflare/
+
+# 中继令牌（曾误入历史，2026-10-26 清洗后在此明令禁止）
+server/tokens.json
+cf-relay/.secrets.json
