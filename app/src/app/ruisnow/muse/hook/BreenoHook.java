@@ -118,6 +118,7 @@ public class BreenoHook extends XposedModule {
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         if (!TARGET_PKG.equals(param.getPackageName())) return;
+        canary("pkg_ready pkg=" + param.getPackageName());
         cl = param.getClassLoader();
         int installed = 0;
         try {
@@ -156,30 +157,60 @@ public class BreenoHook extends XposedModule {
     // Phase 1 records every start intent so the power-key signature can be
     // identified from the module log; the redirect lands once it is known.
     // Switch: /sdcard/MuseShell/powerkey_muse ("0" = off; absent or "1" = on).
-    private int hookPowerKey(ClassLoader cl) throws Exception {
-        Class<?> svc = Class.forName(SPEECH_SERVICE, false, cl);
+    private int hookPowerKey(ClassLoader cl) {
         int n = 0;
-        for (final Method m : svc.getDeclaredMethods()) {
-            if (!"onStartCommand".equals(m.getName())) continue;
-            Class<?>[] p = m.getParameterTypes();
-            if (m.getReturnType() != int.class || p.length != 3
-                    || p[0] != Intent.class || p[1] != int.class || p[2] != int.class) continue;
-            hook(m).intercept(new XposedInterface.Hooker() {
-                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    try {
-                        if (powerKeyOn()) {
-                            List<Object> a = chain.getArgs();
-                            Intent in = a.isEmpty() ? null : (Intent) a.get(0);
-                            appendFile("{\"event\":\"powerkey_start\",\"intent\":\""
-                                    + esc(describeIntent(in)) + "\"}");
+        try {
+            Class<?> svc = Class.forName(SPEECH_SERVICE, false, cl);
+            for (final Method m : svc.getDeclaredMethods()) {
+                Class<?>[] p = m.getParameterTypes();
+                if ("onCreate".equals(m.getName()) && p.length == 0
+                        && m.getReturnType() == void.class) {
+                    hook(m).intercept(new XposedInterface.Hooker() {
+                        @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            canary("svc_oncreate");
+                            return chain.proceed();
                         }
-                    } catch (Throwable ignored) {}
-                    return chain.proceed();
+                    });
+                    n++;
+                    continue;
                 }
-            });
-            n++;
+                if (!"onStartCommand".equals(m.getName())) continue;
+                if (m.getReturnType() != int.class || p.length != 3
+                        || p[0] != Intent.class || p[1] != int.class || p[2] != int.class) continue;
+                hook(m).intercept(new XposedInterface.Hooker() {
+                    @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        try {
+                            if (powerKeyOn()) {
+                                List<Object> a = chain.getArgs();
+                                Intent in = a.isEmpty() ? null : (Intent) a.get(0);
+                                canary("powerkey_start " + describeIntent(in));
+                                appendFile("{\"event\":\"powerkey_start\",\"intent\":\""
+                                        + esc(describeIntent(in)) + "\"}");
+                            }
+                        } catch (Throwable ignored) {}
+                        return chain.proceed();
+                    }
+                });
+                n++;
+            }
+            canary("powerkey_install_ok n=" + n);
+        } catch (Throwable t) {
+            canary("powerkey_install_fail " + t.getClass().getName() + ": " + t.getMessage());
         }
         return n;
+    }
+
+    // Diagnostic canary: plain file write that does not depend on the host
+    // app's context, so a callback/install failure is always visible.
+    private static synchronized void canary(String msg) {
+        try {
+            File dir = new File(Environment.getExternalStorageDirectory(), "MuseShell");
+            dir.mkdirs();
+            FileWriter w = new FileWriter(new File(dir, "hook_canary.log"), true);
+            String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
+            w.write(ts + " " + msg + "\n");
+            w.close();
+        } catch (Throwable ignored) {}
     }
 
     private static String describeIntent(Intent in) {
