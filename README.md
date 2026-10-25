@@ -5,6 +5,9 @@
 
 为一加 13（ColorOS / Android 15）自用而建，包名 `app.ruisnow.muse`，当前版本 0.7.9。
 
+> **给 AI 操作者**：接手远程操作任务前先读 [`AI-OPERATIONS.md`](AI-OPERATIONS.md)——
+> 通道协议、服务端代码、标准作业流程与全部已知的坑都在里面。
+
 ## 架构
 
 ```
