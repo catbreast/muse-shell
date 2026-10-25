@@ -1,6 +1,7 @@
 package app.ruisnow.muse.hook;
 
 import android.app.Notification;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Environment;
@@ -152,42 +153,55 @@ public class BreenoHook extends XposedModule {
 
     // ================= hooks =================
 
-    // ---- power key redirect (diagnostic phase: log SpeechService starts) ----
-    // ColorOS wakes Breeno on power long-press by starting SpeechService.
-    // Phase 1 records every start intent so the power-key signature can be
-    // identified from the module log; the redirect lands once it is known.
+    // ---- power key hijack: power long-press wakes Muse instead of Breeno ----
+    // ColorOS wakes Breeno on power long-press by starting SpeechService with
+    // action heytap.intent.action.ACTIVATE_SPEECH_ASSIST (dumpsys evidence).
+    // We log every start (canary + jsonl, for signature retargeting), and when
+    // the activation action arrives we launch Muse and swallow the start so
+    // Breeno's own handling (and UI) never runs.
     // Switch: /sdcard/MuseShell/powerkey_muse ("0" = off; absent or "1" = on).
+    private static final String ACTION_ACTIVATE_SPEECH =
+            "heytap.intent.action.ACTIVATE_SPEECH_ASSIST";
+
     private int hookPowerKey(ClassLoader cl) {
         int n = 0;
         try {
             Class<?> svc = Class.forName(SPEECH_SERVICE, false, cl);
-            for (final Method m : svc.getDeclaredMethods()) {
-                Class<?>[] p = m.getParameterTypes();
-                if ("onCreate".equals(m.getName()) && p.length == 0
-                        && m.getReturnType() == void.class) {
-                    hook(m).intercept(new XposedInterface.Hooker() {
-                        @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                            canary("svc_oncreate");
-                            return chain.proceed();
-                        }
-                    });
-                    n++;
-                    continue;
-                }
-                if (!"onStartCommand".equals(m.getName())) continue;
-                if (m.getReturnType() != int.class || p.length != 3
-                        || p[0] != Intent.class || p[1] != int.class || p[2] != int.class) continue;
-                hook(m).intercept(new XposedInterface.Hooker() {
+            // SpeechService may inherit onCreate/onStartCommand from a base
+            // class; walk the hierarchy and hook the declaring methods.
+            Method onCreate = findMethodInHierarchy(svc, "onCreate");
+            if (onCreate != null && onCreate.getReturnType() == void.class) {
+                hook(onCreate).intercept(new XposedInterface.Hooker() {
                     @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                        try {
-                            if (powerKeyOn()) {
-                                List<Object> a = chain.getArgs();
-                                Intent in = a.isEmpty() ? null : (Intent) a.get(0);
-                                canary("powerkey_start " + describeIntent(in));
-                                appendFile("{\"event\":\"powerkey_start\",\"intent\":\""
-                                        + esc(describeIntent(in)) + "\"}");
+                        canary("svc_oncreate");
+                        return chain.proceed();
+                    }
+                });
+                n++;
+            }
+            Method onStart = findMethodInHierarchy(svc, "onStartCommand",
+                    Intent.class, int.class, int.class);
+            if (onStart != null && onStart.getReturnType() == int.class) {
+                hook(onStart).intercept(new XposedInterface.Hooker() {
+                    @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        List<Object> a = chain.getArgs();
+                        Intent in = a.isEmpty() ? null : (Intent) a.get(0);
+                        if (powerKeyOn()) {
+                            canary("powerkey_start " + describeIntent(in));
+                            appendFile("{\"event\":\"powerkey_start\",\"intent\":\""
+                                    + esc(describeIntent(in)) + "\"}");
+                            if (in != null && ACTION_ACTIVATE_SPEECH.equals(in.getAction())) {
+                                Object self = chain.getThisObject();
+                                if (self instanceof Context
+                                        && launchMuse((Context) self)) {
+                                    canary("powerkey_hijack_ok");
+                                    appendFile("{\"event\":\"powerkey_hijack\"}");
+                                    // Swallow: Breeno never sees the activation.
+                                    return Integer.valueOf(1);
+                                }
+                                canary("powerkey_hijack_launch_failed");
                             }
-                        } catch (Throwable ignored) {}
+                        }
                         return chain.proceed();
                     }
                 });
@@ -198,6 +212,33 @@ public class BreenoHook extends XposedModule {
             canary("powerkey_install_fail " + t.getClass().getName() + ": " + t.getMessage());
         }
         return n;
+    }
+
+    private static Method findMethodInHierarchy(Class<?> cls, String name, Class<?>... params) {
+        for (Class<?> c = cls; c != null; c = c.getSuperclass()) {
+            try {
+                Method m = c.getDeclaredMethod(name, params);
+                m.setAccessible(true);
+                return m;
+            } catch (NoSuchMethodException ignored) {}
+        }
+        return null;
+    }
+
+    private static boolean launchMuse(Context ctx) {
+        try {
+            Intent open = ctx.getPackageManager().getLaunchIntentForPackage("com.facebook.aura");
+            if (open == null) {
+                open = new Intent(Intent.ACTION_MAIN);
+                open.setComponent(new android.content.ComponentName(
+                        "com.facebook.aura", "com.facebook.aura.main.AuraMainActivity"));
+            }
+            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(open);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     // Diagnostic canary: plain file write that does not depend on the host
