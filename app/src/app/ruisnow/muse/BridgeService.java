@@ -21,6 +21,7 @@ import android.view.WindowManager;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 public class BridgeService extends Service {
@@ -213,7 +214,9 @@ public class BridgeService extends Service {
                 String base = Prefs.baseUrl(this);
                 String token = Prefs.token(this);
                 String dev = Prefs.deviceId(this);
-                HttpUtil.Resp r = HttpUtil.request("GET", base + "/poll", token, dev, null, 10000, 40000);
+                // 0.7.10: ?n=8 让中继在有一批待办时一次返回多条（{cmds:[...]}），
+                // 连环操作不用每条都等一轮长轮询；旧中继忽略该参数、仍返回单条。
+                HttpUtil.Resp r = HttpUtil.request("GET", base + "/poll?n=8", token, dev, null, 10000, 40000);
                 lastPollOkMs = System.currentTimeMillis();
                 if (r.code == 401) {
                     setNotificationText("令牌不对，检查配对设置");
@@ -232,7 +235,7 @@ public class BridgeService extends Service {
                 }
                 backoff = 2000;
                 setNotificationText("已连接，执行命令中…");
-                JSONObject cmd = new JSONObject(r.body);
+                JSONObject first = new JSONObject(r.body);
                 // The wake lock is held for the service lifetime (onCreate);
                 // the old per-dispatch acquire/release would have dropped it.
                 // 0.6.10 (agy review P0-2): a command may run for minutes and
@@ -243,8 +246,17 @@ public class BridgeService extends Service {
                 dispatching = true;
                 lastPollOkMs = System.currentTimeMillis();
                 try {
-                    JSONObject result = dispatcher.dispatch(cmd);
-                    HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
+                    JSONArray cmds = first.optJSONArray("cmds");
+                    if (cmds != null) {
+                        // 0.7.10 批量：按到达顺序逐条执行、逐条回结果
+                        for (int i = 0; i < cmds.length(); i++) {
+                            JSONObject result = dispatcher.dispatch(cmds.getJSONObject(i));
+                            HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
+                        }
+                    } else {
+                        JSONObject result = dispatcher.dispatch(first);
+                        HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
+                    }
                 } finally {
                     dispatching = false;
                 }

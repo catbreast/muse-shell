@@ -3,7 +3,9 @@
 用法：
   phone.py status
   phone.py call <tool> ['<args-json>'] [--timeout N]
+  phone.py batch '<calls-json>' [--timeout N]
 例：phone.py call files.list '{"path":"/sdcard/MuseShell"}'
+    phone.py batch '[{"tool":"ping","args":{}},{"tool":"ping","args":{}}]'
 """
 import json
 import os
@@ -50,6 +52,25 @@ def req(method, path, body=None, timeout=60, retries=2):
     raise last
 
 
+def batch_call(calls, timeout=120):
+    """一次下发多条指令（一个往返入队），等齐后按入参顺序返回结果列表。
+    每条自动分配客户端 id：传输重试时服务端按 id 幂等去重，不重复执行。"""
+    items = [{"id": uuid.uuid4().hex[:12], "tool": c["tool"], "args": c.get("args", {})}
+             for c in calls]
+    ids = [c["id"] for c in items]
+    got = {}
+    deadline = time.time() + timeout
+    code, res = req("POST", "/batch", {"calls": items, "wait": 50}, timeout=65)
+    while True:
+        for k, v in (res.get("results") or {}).items():
+            got[k] = v
+        pending = [i for i in ids if i not in got]
+        if not pending or code not in (200, 202) or time.time() >= deadline:
+            break
+        code, res = req("POST", "/batchwait", {"ids": pending, "wait": 50}, timeout=65)
+    return [got.get(i, {"ok": False, "error": "phone_timeout_or_offline"}) for i in ids]
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -78,6 +99,17 @@ def main():
             res = {"ok": False, "error": f"transport: {e}"}
         print(json.dumps(res, ensure_ascii=False, indent=1))
         return 0 if res.get("ok") else 1
+    if sys.argv[1] == "batch":
+        calls = json.loads(sys.argv[2])
+        timeout = 120
+        if "--timeout" in sys.argv:
+            timeout = float(sys.argv[sys.argv.index("--timeout") + 1])
+        try:
+            results = batch_call(calls, timeout=timeout)
+        except Exception as e:
+            results = [{"ok": False, "error": f"transport: {e}"}]
+        print(json.dumps(results, ensure_ascii=False, indent=1))
+        return 0 if all(r.get("ok") for r in results) else 1
     print(__doc__)
     return 2
 

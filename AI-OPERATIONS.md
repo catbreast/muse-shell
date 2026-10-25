@@ -36,10 +36,12 @@ AI（沙盒 VM） ──HTTPS──► CF 中继 phone.ruisnow.de ──长轮�
 
 | 路径 | 方法 | 令牌 | 语义 |
 |---|---|---|---|
-| `/poll` | GET | PHONE | 手机长轮询取一条命令；无命令挂起 25 秒后回 `204`；有命令回 `{id, tool, args}` |
+| `/poll` | GET | PHONE | 手机长轮询取命令；无命令挂起 25 秒后回 `204`；有命令回 `{id, tool, args}`。带 `?n=k`（0.7.10+ 壳）时一次最多回 k 条 `{cmds:[...]}` |
 | `/result` | POST | PHONE | 手机回填结果 `{id, ok, result｜error}`；唤醒对应等待者，无人等则暂存结果表 |
 | `/call` | POST | ADMIN | 入队并等待：`{id?, tool, args, wait}`；`wait` 被钳在 1–55 秒，超时回 `202 {pending:true, id}` |
 | `/wait` | POST | ADMIN | `{id, wait}` 续等某条结果；同为 202 语义 |
+| `/batch` | POST | ADMIN | 一次入队多条并等齐：`{calls:[{id?, tool, args}], wait}`；全回 `200 {results:{id:结果}}`，超时 `202 {pending:true, results, pending_ids}` |
+| `/batchwait` | POST | ADMIN | `{ids:[...], wait}` 续等一批未回的结果，返回形同 `/batch` |
 | `/status` | GET | ADMIN | `{device, last_seen_ago_sec, queued, last_tool}`——**判断手机在不在线只看这个** |
 | `/inbox*` | — | BREENO | 历史遗留的小布收件箱（投递/答复/确认）；接管功能已于 0.7.9 摘除，此组接口闲置，勿再使用 |
 
@@ -54,6 +56,9 @@ AI（沙盒 VM） ──HTTPS──► CF 中继 phone.ruisnow.de ──长轮�
 
 - 改 `cf-relay/src/index.js` 后在 `cf-relay/` 执行 `cf deploy` 发布；部署前先想清协议兼容：
   手机端 BridgeService 与沙盒端 phone.py 都按本协议说话，改协议要三方一起动。
+- DO 落点（2026-10-26 起）：实例名 `main-apac-v1`，`get(id, {locationHint:"apac"})`
+  （提示仅创建时生效）。旧实例 `main` 已弃（切换时队列为空；inbox 随小布摘除停用未迁移）。
+  再迁落点 = 换新实例名 + 部署，须挑队列为空时做。
 - 旧 VM 版中继 `server/server.py`（同协议）保留作回滚参考：把壳控制台的服务地址与
   `PHONE_BASE` 一起切回旧地址即可，**现行不要启用**（双中继会抢命令）。
 

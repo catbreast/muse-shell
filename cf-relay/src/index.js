@@ -1,10 +1,14 @@
 // Muse 壳中继（Cloudflare Worker + Durable Object 版）
 // 协议与原 VM 上的 server.py 完全一致：
-//   GET  /poll   (phone 令牌) 长轮询取命令，25s 无命令返回 204
+//   GET  /poll   (phone 令牌) 长轮询取命令，25s 无命令返回 204；
+//                带 ?n=k（k≥2，新版壳）时一次最多返回 k 条 {cmds:[...]}
 //   POST /result (phone 令牌) 回填结果
 //   POST /call   (admin 令牌) 入队并等待结果；单次 HTTP 最多等 wait 秒(≤55)，
 //                超时返回 202 {pending:true,id}，客户端续用 /wait 取
 //   POST /wait   (admin 令牌) {id, wait} 等某条结果
+//   POST /batch  (admin 令牌) {calls:[{id?,tool,args}], wait} 一次入队多条并等齐；
+//                超时 202 {pending:true, results:{id:result}, pending_ids:[...]}
+//   POST /batchwait (admin 令牌) {ids:[...], wait} 续等一批未回的结果
 //   GET  /status (admin 令牌) {device,last_seen_ago_sec,queued,last_tool}
 // 单个 DO 实例串行处理全部状态，无竞态；队列持久化，进程被回收不丢命令。
 
@@ -134,13 +138,25 @@ export class Relay {
 
     if (path.startsWith("/poll")) {
       this.touch(req);
+      const n = Math.max(1, Math.min(parseInt(url.searchParams.get("n") || "1", 10) || 1, 16));
       if (this.queue.length) {
-        const cmd = this.queue.shift();
+        if (n === 1) {
+          const cmd = this.queue.shift();
+          await this.saveQueue();
+          return json(cmd, 200);
+        }
+        const cmds = this.queue.splice(0, n);
         await this.saveQueue();
-        return json(cmd, 200);
+        return json({ cmds }, 200);
       }
       const cmd = await this.waitPoll(25000);
-      if (cmd) return json(cmd, 200);
+      if (cmd) {
+        if (n === 1) return json(cmd, 200);
+        const cmds = [cmd];
+        while (cmds.length < n && this.queue.length) cmds.push(this.queue.shift());
+        if (cmds.length > 1) await this.saveQueue();
+        return json({ cmds }, 200);
+      }
       this.touch(req);
       return new Response(null, { status: 204 });
     }
@@ -183,6 +199,37 @@ export class Relay {
       const res = await this.waitResult(id, wait * 1000);
       if (res === null) return json({ pending: true, id }, 202);
       return json(res, 200);
+    }
+
+    if (path.startsWith("/batch")) {
+      const data = await req.json().catch(() => ({}));
+      const wait = Math.max(1, Math.min(Number(data.wait || 55), 55));
+      let ids = [];
+      if (path.startsWith("/batchwait")) {
+        ids = Array.isArray(data.ids) ? data.ids.filter((x) => typeof x === "string") : [];
+        if (!ids.length) return json({ error: "ids_required" }, 400);
+      } else {
+        const calls = Array.isArray(data.calls) ? data.calls : [];
+        if (!calls.length) return json({ error: "calls_required" }, 400);
+        for (const c of calls) {
+          if (!c || !c.tool) continue;
+          const id = (typeof c.id === "string" && /^[a-zA-Z0-9-]{6,32}$/.test(c.id))
+            ? c.id
+            : crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+          ids.push(id);
+          this.state.last_tool = c.tool;
+          const already = this.queue.some((q) => q.id === id) || this.resultWaiters.has(id) || this.results.has(id);
+          if (!already) this.enqueue({ id, tool: c.tool, args: c.args || {} });
+        }
+        this.saveState();
+        if (!ids.length) return json({ error: "calls_required" }, 400);
+      }
+      const settled = await Promise.all(ids.map((id) => this.waitResult(id, wait * 1000)));
+      const results = {};
+      const pending = [];
+      ids.forEach((id, i) => { if (settled[i] === null) pending.push(id); else results[id] = settled[i]; });
+      if (pending.length) return json({ pending: true, results, pending_ids: pending }, 202);
+      return json({ results }, 200);
     }
 
     if (path.startsWith("/status")) {
@@ -269,13 +316,16 @@ export default {
     const token = req.headers.get("X-Token") || "";
     const isPhone = path.startsWith("/poll") || path.startsWith("/result");
     const isAdmin = path.startsWith("/call") || path.startsWith("/wait") || path.startsWith("/status")
+      || path.startsWith("/batch")
       || path === "/inbox/pending" || path === "/inbox/answer";
     const isBreeno = path === "/inbox" || path === "/inbox/reply" || path === "/inbox/ack";
     if (!isPhone && !isAdmin && !isBreeno) return json({ error: "not_found" }, 404);
     if (isPhone && token !== env.PHONE_TOKEN) return json({ error: "bad_token" }, 401);
     if (isAdmin && token !== env.ADMIN_TOKEN) return json({ error: "bad_token" }, 401);
     if (isBreeno && token !== env.BREENO_TOKEN) return json({ error: "bad_token" }, 401);
-    const stub = env.RELAY.get(env.RELAY.idFromName("main"));
+    // 2026-10-26：DO 落点迁亚太。新实例名 main-apac-v1（旧 main 的队列切换时为空、
+    // inbox 已随小布钩子摘除停用，不迁移）；locationHint 仅在实例创建时生效。
+    const stub = env.RELAY.get(env.RELAY.idFromName("main-apac-v1"), { locationHint: "apac" });
     return stub.fetch(req);
   },
 };
