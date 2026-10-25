@@ -20,25 +20,51 @@ ENGINE = RapidOCR()
 
 
 def call(tool, args, timeout=60):
-    res = phone_req("POST", "/call", {"tool": tool, "args": args, "timeout": timeout},
+    _, res = phone_req("POST", "/call", {"tool": tool, "args": args, "timeout": timeout},
                     timeout=timeout + 15)
     if not res.get("ok"):
         raise RuntimeError(f"{tool} failed: {res.get('error')}")
     return res["result"]
 
 
+def grab_parts(tool, args):
+    """see tools return the JPEG as base64 chunks (part/parts/data);
+    assemble them in order."""
+    first = call(tool, dict(args, part=0), 30)
+    if "data" not in first:
+        raise RuntimeError(f"{tool}: no frame data (result keys={list(first.keys())})")
+    chunks = [first["data"]]
+    for p in range(1, int(first.get("parts", 1))):
+        chunks.append(call(tool, dict(args, part=p), 30)["data"])
+    return base64.b64decode("".join(chunks))
+
+
 def grab(vscreen):
     """Return (jpeg_bytes, real_w, real_h)."""
     if vscreen:
-        r = call("vscreen.see", {}, 30)
-        img = base64.b64decode(r["jpeg_base64"])
+        img = grab_parts("vscreen.see", {})
+        st = call("vscreen.status", {}, 20)
+        if st.get("width") and st.get("height"):
+            return img, int(st["width"]), int(st["height"])
         im = Image.open(io.BytesIO(img))
         return img, im.width, im.height
-    r = call("a11y.see", {"maxWidth": 1080}, 30)
-    img = base64.b64decode(r["jpeg_base64"])
-    nodes = call("a11y.nodes", {"maxNodes": 5}, 20)
-    root = nodes["nodes"][0]
-    return img, root["w"], root["h"]
+    img = grab_parts("a11y.see", {"maxWidth": 1080})
+    # Real display size for tap scaling: a11y root bounds, else wm size.
+    real_w = real_h = None
+    try:
+        nodes = call("a11y.nodes", {"maxNodes": 5}, 20)
+        root = nodes["nodes"][0]
+        real_w, real_h = root["w"], root["h"]
+    except Exception:
+        pass
+    if not real_w:
+        out = call("shell", {"cmd": "wm size"}, 20)["stdout"]
+        for line in out.splitlines():
+            if "size:" in line:
+                wh = line.rsplit(" ", 1)[-1].strip().split("x")
+                real_w, real_h = int(wh[0]), int(wh[1])
+                break
+    return img, real_w, real_h
 
 
 def ocr_index(img_bytes):
