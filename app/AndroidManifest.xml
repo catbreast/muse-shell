@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="app.ruisnow.muse"
-    android:versionCode="39"
-    android:versionName="0.7.1.4">
+    android:versionCode="40"
+    android:versionName="0.7.1.5">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+
+    <!-- package visibility: floating ball launches the Muse app by package name -->
+    <queries>
+        <package android:name="com.facebook.aura" />
+    </queries>
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
