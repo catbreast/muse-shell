@@ -215,18 +215,6 @@ public class MainActivity extends Activity {
         });
         root.addView(autoConn);
 
-        final CheckBox breeno = new CheckBox(this);
-        breeno.setText("小布接管（对小布说的话转交 Muse 处理）");
-        breeno.setChecked(breenoTakeoverOn());
-        breeno.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
-                setBreenoTakeover(checked);
-                toast(checked ? "小布接管已开" : "小布接管已关（小布恢复原样）");
-                refresh();
-            }
-        });
-        root.addView(breeno);
-
         CheckBox browserBox = new CheckBox(this);
         browserBox.setText("AI 浏览器（允许 Muse 操作内嵌网页）");
         browserBox.setChecked(Prefs.browserEnabled(this));
@@ -277,33 +265,6 @@ public class MainActivity extends Activity {
         tokenEdit.setText(Prefs.token(this));
         pinEdit.setText(Prefs.sp(this).getString("unlock_pin", ""));
         refresh();
-    }
-
-    /** Breeno takeover switch shared with the LSPosed hook (which runs inside
-     *  Breeno's process and cannot read our SharedPreferences): a small file in
-     *  the shared MuseShell dir. Absent file or "1" = on, "0" = off. */
-    static boolean breenoTakeoverOn() {
-        try {
-            java.io.File f = new java.io.File(Environment.getExternalStorageDirectory(), "MuseShell/breeno_takeover");
-            if (!f.exists()) return true;
-            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
-            String v = r.readLine();
-            r.close();
-            return v == null || !"0".equals(v.trim());
-        } catch (Exception e) {
-            return true;
-        }
-    }
-
-    static void setBreenoTakeover(boolean on) {
-        try {
-            java.io.File dir = new java.io.File(Environment.getExternalStorageDirectory(), "MuseShell");
-            if (!dir.exists()) dir.mkdirs();
-            java.io.FileWriter w = new java.io.FileWriter(new java.io.File(dir, "breeno_takeover"));
-            w.write(on ? "1" : "0");
-            w.close();
-        } catch (Exception ignored) {
-        }
     }
 
     private void startBridge() {
@@ -369,7 +330,6 @@ public class MainActivity extends Activity {
         sb.append("已配对：").append(Prefs.token(this).length() > 0 ? "是" : "否").append("\n");
         sb.append("解锁 PIN：").append(Prefs.sp(this).getString("unlock_pin", "").length() > 0 ? "已设置" : "未设置").append("\n");
         sb.append("自动连接：").append(Prefs.autoConnect(this) ? "开" : "关").append("\n");
-        sb.append("小布接管：").append(breenoTakeoverOn() ? "开" : "关").append("\n");
         statusView.setText(sb.toString());
         logView.setText(Ledger.recent(this, 30));
     }

@@ -121,34 +121,21 @@ public class BreenoHook extends XposedModule {
         if (!TARGET_PKG.equals(param.getPackageName())) return;
         canary("pkg_ready pkg=" + param.getPackageName());
         cl = param.getClassLoader();
+        // 2026-10-26 (user order): the conversation hooks (dispatch / outbound
+        // / inbound / notifications) and the housekeeper are NO LONGER
+        // installed — Breeno conversations are not hooked at all. Their code
+        // remains below, inert, for history. Only the power-key hijack stays:
+        // it intercepts the SpeechService activation start, not conversations.
+        // (The file-based takeover switch never reliably reached this
+        // process — scoped storage blocks the read and the fallback defaults
+        // to ON — which is why removing the installs is the definitive off.)
         int installed = 0;
-        try {
-            installed += hookDispatch(cl);
-        } catch (Throwable t) {
-            xlog("dispatch install failed: " + t);
-        }
-        try {
-            installed += hookOutbound(cl);
-        } catch (Throwable t) {
-            xlog("outbound install failed: " + t);
-        }
-        try {
-            installed += hookInbound(cl);
-        } catch (Throwable t) {
-            xlog("inbound install failed: " + t);
-        }
-        try {
-            installed += hookNotifications(cl);
-        } catch (Throwable t) {
-            xlog("notification install failed: " + t);
-        }
         try {
             installed += hookPowerKey(cl);
         } catch (Throwable t) {
             xlog("powerkey install failed: " + t);
         }
         xlog("hooks installed=" + installed + " in " + param.getPackageName());
-        startHousekeeper();
     }
 
     // ================= hooks =================
