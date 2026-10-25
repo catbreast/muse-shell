@@ -132,6 +132,7 @@ public class BreenoHook extends XposedModule {
         int installed = 0;
         try {
             installed += hookPowerKey(cl);
+            installed += hookSafeLayer(cl);
         } catch (Throwable t) {
             xlog("powerkey install failed: " + t);
         }
@@ -150,6 +151,68 @@ public class BreenoHook extends XposedModule {
     private static final String ACTION_ACTIVATE_SPEECH =
             "heytap.intent.action.ACTIVATE_SPEECH_ASSIST";
     private static volatile long lastHijackTs = 0;
+
+    // ---- screen-recognition safe-layer bypass (user order 2026-10-26) ----
+    // Breeno's screen recognition (识屏/圈选: CUI float window + SmartScreenView)
+    // refuses on windows it classifies as a "safe layer" (credential / OTP /
+    // payment surfaces). The user verified screenshots of those surfaces work
+    // on this device; only this in-app policy check blocks recognition. Force
+    // the checks to report "not a safe layer":
+    //   NewCuiFloatViewController.W1()           float-window gate for the toast
+    //   NewCuiSafeLayerApiHelper.n(Context)      its decider on the API>=35 path
+    //   CuiSafeLayerApiHelper.gestureIsSafeLayer SmartScreenView gesture path
+    //   LayerInfo.isSafeLayer()/getIsSafeLayer() bean consumers
+    // Names match speechassist 13.3.2 (some R8-obfuscated); a Breeno update
+    // can rename them — the hooks then install 0 and log, never break Breeno.
+    private int hookSafeLayer(ClassLoader cl) {
+        int n = 0;
+        try {
+            n += hookBoolFalse(cl, "com.heytap.speechassist.cui.floatwindow.NewCuiFloatViewController", "W1", 0, true);
+            n += hookBoolFalse(cl, "com.heytap.speechassist.cui.floatwindow.input.NewCuiSafeLayerApiHelper", "n", 1, false);
+            n += hookBoolFalse(cl, "com.oplus.smartsdk.cui.utils.CuiSafeLayerApiHelper", "gestureIsSafeLayer", -1, false);
+            n += hookBoolFalse(cl, "com.oplus.smartsdk.cui.bean.LayerInfo", "isSafeLayer", 0, false);
+            n += hookBoolFalse(cl, "com.oplus.smartsdk.cui.bean.LayerInfo", "getIsSafeLayer", 0, false);
+        } catch (Throwable t) {
+            canary("safelayer_install_fail " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+        canary("safelayer_install_ok n=" + n);
+        return n;
+    }
+
+    /** Hook every boolean method named {@code methodName} (optionally with an
+     *  exact parameter count) on a class — and, when {@code searchNested},
+     *  on all its nested classes — forcing the result to false. */
+    private int hookBoolFalse(ClassLoader cl, String className, String methodName,
+                              int paramCount, boolean searchNested) {
+        int n = 0;
+        try {
+            Class<?> root = Class.forName(className, false, cl);
+            List<Class<?>> stack = new ArrayList<>();
+            stack.add(root);
+            while (!stack.isEmpty()) {
+                Class<?> k = stack.remove(stack.size() - 1);
+                for (final Method m : k.getDeclaredMethods()) {
+                    if (!methodName.equals(m.getName())) continue;
+                    if (m.getReturnType() != boolean.class) continue;
+                    if (paramCount >= 0 && m.getParameterTypes().length != paramCount) continue;
+                    m.setAccessible(true);
+                    hook(m).intercept(new XposedInterface.Hooker() {
+                        @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                            return Boolean.FALSE;
+                        }
+                    });
+                    n++;
+                }
+                if (searchNested) {
+                    for (Class<?> inner : k.getDeclaredClasses()) stack.add(inner);
+                }
+            }
+        } catch (Throwable t) {
+            canary("safelayer_hook_fail " + className + "#" + methodName
+                    + " " + t.getClass().getSimpleName());
+        }
+        return n;
+    }
 
     private int hookPowerKey(ClassLoader cl) {
         int n = 0;
