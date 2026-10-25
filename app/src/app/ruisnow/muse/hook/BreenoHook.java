@@ -162,6 +162,7 @@ public class BreenoHook extends XposedModule {
     // Switch: /sdcard/MuseShell/powerkey_muse ("0" = off; absent or "1" = on).
     private static final String ACTION_ACTIVATE_SPEECH =
             "heytap.intent.action.ACTIVATE_SPEECH_ASSIST";
+    private static volatile long lastHijackTs = 0;
 
     private int hookPowerKey(ClassLoader cl) {
         int n = 0;
@@ -191,9 +192,19 @@ public class BreenoHook extends XposedModule {
                             appendFile("{\"event\":\"powerkey_start\",\"intent\":\""
                                     + esc(describeIntent(in)) + "\"}");
                             if (in != null && ACTION_ACTIVATE_SPEECH.equals(in.getAction())) {
+                                // One power press can start SpeechService more
+                                // than once (multiple Breeno processes / sticky
+                                // redelivery). Launch at most once per 2.5s;
+                                // extra starts are swallowed silently so Muse
+                                // is not re-fronted with a stray animation.
+                                long now = System.currentTimeMillis();
+                                if (now - lastHijackTs < 2500) {
+                                    return Integer.valueOf(1);
+                                }
                                 Object self = chain.getThisObject();
                                 if (self instanceof Context
                                         && launchMuse((Context) self)) {
+                                    lastHijackTs = now;
                                     canary("powerkey_hijack_ok");
                                     appendFile("{\"event\":\"powerkey_hijack\"}");
                                     // Swallow: Breeno never sees the activation.
@@ -233,7 +244,8 @@ public class BreenoHook extends XposedModule {
                 open.setComponent(new android.content.ComponentName(
                         "com.facebook.aura", "com.facebook.aura.main.AuraMainActivity"));
             }
-            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
             ctx.startActivity(open);
             return true;
         } catch (Throwable t) {
