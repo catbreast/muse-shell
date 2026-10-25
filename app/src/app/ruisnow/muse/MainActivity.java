@@ -183,18 +183,6 @@ public class MainActivity extends Activity {
         row4.addView(shizukuBtn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
         root.addView(row4);
 
-        CheckBox kill = new CheckBox(this);
-        kill.setText("急停开关（开启后拒绝一切工具调用）");
-        kill.setChecked(Prefs.killSwitch(this));
-        kill.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
-                Prefs.setKillSwitch(MainActivity.this, checked);
-                toast(checked ? "急停已开启" : "急停已关闭");
-                refresh();
-            }
-        });
-        root.addView(kill);
-
         CheckBox shellTrust = new CheckBox(this);
         shellTrust.setText("root shell 免审（默认开启，重启保持）");
         shellTrust.setChecked(Prefs.shellTrust(this));
@@ -379,7 +367,6 @@ public class MainActivity extends Activity {
         sb.append("设备 ID：").append(Prefs.deviceId(this)).append("\n");
         sb.append("服务地址：").append(Prefs.baseUrl(this)).append("\n");
         sb.append("已配对：").append(Prefs.token(this).length() > 0 ? "是" : "否").append("\n");
-        sb.append("急停：").append(Prefs.killSwitch(this) ? "开启" : "关闭").append("\n");
         sb.append("解锁 PIN：").append(Prefs.sp(this).getString("unlock_pin", "").length() > 0 ? "已设置" : "未设置").append("\n");
         sb.append("自动连接：").append(Prefs.autoConnect(this) ? "开" : "关").append("\n");
         sb.append("小布接管：").append(breenoTakeoverOn() ? "开" : "关").append("\n");

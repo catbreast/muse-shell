@@ -134,12 +134,11 @@ public class BridgeService extends Service {
         Notification.Builder b = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL)
                 : new Notification.Builder(this);
-        b.addAction(new Notification.Action.Builder(
-                android.R.drawable.ic_media_play, "启动", startPendingIntent(1)).build());
+        // One state-flipping action: while running it reads 停止; the
+        // stopped notice posted by onDestroy carries 启动 instead.
         b.addAction(new Notification.Action.Builder(
                 android.R.drawable.ic_lock_power_off, "停止", stopPendingIntent(2)).build());
-        return b.setContentTitle("Muse 壳")
-                .setContentText(text)
+        return b.setContentText(text)
                 .setSmallIcon(R.drawable.ic_stat_muse)
                 .setContentIntent(pi)
                 .setOngoing(true)
@@ -336,8 +335,7 @@ public class BridgeService extends Service {
                     : new Notification.Builder(this);
             b.addAction(new Notification.Action.Builder(
                     android.R.drawable.ic_media_play, "启动", startPendingIntent(3)).build());
-            Notification stopped = b.setContentTitle("Muse 壳")
-                    .setContentText("已停止")
+            Notification stopped = b.setContentText("已停止")
                     .setSmallIcon(R.drawable.ic_stat_muse)
                     .setContentIntent(pi)
                     .setOngoing(false)
