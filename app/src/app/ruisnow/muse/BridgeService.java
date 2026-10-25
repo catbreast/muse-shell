@@ -279,7 +279,7 @@ public class BridgeService extends Service {
         supervisor.start();
     }
 
-    // ---------- floating ball: tap opens console, long-press toggles kill switch ----------
+    // ---------- floating ball: tap opens Muse app, long-press toggles kill switch ----------
 
     private void attachBall() {
         try {
@@ -334,9 +334,21 @@ public class BridgeService extends Service {
                                 Toast.makeText(BridgeService.this,
                                         on ? "急停已开启" : "急停已关闭", Toast.LENGTH_SHORT).show();
                             } else if (moved < 20) {
-                                Intent open = new Intent(BridgeService.this, MainActivity.class);
-                                open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                                startActivity(open);
+                                boolean launched = false;
+                                try {
+                                    Intent open = getPackageManager()
+                                            .getLaunchIntentForPackage("com.facebook.aura");
+                                    if (open != null) {
+                                        open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                        startActivity(open);
+                                        launched = true;
+                                    }
+                                } catch (Exception ignored) {}
+                                if (!launched) {
+                                    Intent console = new Intent(BridgeService.this, MainActivity.class);
+                                    console.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                    startActivity(console);
+                                }
                             }
                             break;
                     }
