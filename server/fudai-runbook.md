@@ -5,10 +5,16 @@
 
 ## 环境与铁律
 
-- 工具都在 `~/workspace/muse-android-shell/server/`：`phone.py call <tool> '<json>'`、
-  `see_parts.py vscreen <out.jpg> 32000`（切片取帧，输出 scale，屏坐标 = 图坐标 / scale）、
-  OCR：`./ocr-venv/bin/python ocrtap.py file <图>`（给 center_img，换算同上）。
-- 全程只在**虚拟屏**（720×1280@320）里操作，**绝不碰主屏**：a11y.* 的手势只落主屏，禁用；
+- 工具都在 `~/workspace/muse-android-shell/server/`：`phone.py call <tool> '<json>'`。
+- **看图首选手机本机 OCR（图不出手机、整帧约 2 秒、坐标即真实屏像素、无需换算）**：
+  `shell` 工具跑 `SFID=$(dumpsys SurfaceFlinger --display-id | grep MuseScreen | grep -oE 'Display [0-9]+' | grep -oE '[0-9]+')`
+  取当前虚拟屏的 SurfaceFlinger ID（每次建屏都会变，必须现查），
+  `screencap -d $SFID -p /sdcard/MuseShell/frame.png`，再
+  `linux.exec` 跑 `python3 /root/muse_ocr.py /mnt/sdcard/MuseShell/frame.png`
+  （脚本在手机 Debian 容器里，输出 JSON：items=[文, cx, cy]）。
+  备用（容器不可用时）：`see_parts.py vscreen <out.jpg> 32000` 切片取帧回沙盒 +
+  `./ocr-venv/bin/python ocrtap.py file <图>`（屏坐标 = 图坐标 / scale）。
+- 全程只在**虚拟屏**（1080×2376@480，逻辑宽 360dp）里操作，**绝不碰主屏**：a11y.* 的手势只落主屏，禁用；
   只用 vscreen.* 与 shell 工具。
 - 不下单、不付款、不点商品购买按钮。抽券之外不点任何商品卡（奖励商品页只用左上角箭头返回）。
 
@@ -16,14 +22,14 @@
 
 1. `phone.py call status '{}'` 确认壳在线（version ≥0.6.6）；失败等 60 秒重试一次，再失败报错退出。
 2. 解锁：`phone.py call lock.unlock '{}'`（零参数，PIN 在手机端；未锁自动跳过）。
-3. `vscreen.create {"width":720,"height":1280,"dpi":320}`（已存在会报错，忽略），
+3. `vscreen.create {"width":1080,"height":2376,"dpi":480}`（已存在会报错，忽略），
    `vscreen.launch {"package":"com.xunmeng.pinduoduo"}`，等 6 秒。
 4. 进消费券页：取帧 OCR 找「百亿」点入专区（中途弹免费礼物窗就点右上 × 关掉，
    坐标每帧现算）；专区页 OCR 找「百亿消费券」条点入。页面标题出现「消费券」、
    能看到「消费券福袋 10.16-11.13」字样即到位。
 5. 看三袋状态（袋行按钮文案）：
    - 「去使用」= 已抽到，跳过。
-   - 「立即抽福袋」= 直接点 → 结果弹窗点「开心收下」（约在屏 (360,936) 附近，每帧 OCR 定）。
+   - 「立即抽福袋」= 直接点 → 结果弹窗点「开心收下」（约在屏 (540,1737) 附近，每帧 OCR 定）。
    - 「邀好友抽福袋」或「抽福袋」（需组队）= 走第 6 步加入循环，成功后袋位翻成「立即抽福袋」再抽。
    - 「抽N个后开启」= 前面的袋抽完自然开启，回头再看。
 6. **抢码加入（核心，拼速度）**：每轮 ≤6 次尝试：
@@ -32,11 +38,13 @@
    NUM=<R 里的 number>
    phone.py call shell '{"cmd":"am start --display <显示屏ID> -a android.intent.action.VIEW -d \"pinduoduo://com.xunmeng.pinduoduo/search_result.html?search_key=<NUM>\""}'
    sleep 4
-   vscreen.tap (360,783)   # 「立即加入抽福袋」固定位置，盲点
+   vscreen.tap (540,1453)   # 「立即加入抽福袋」盲点（新尺寸比例换算值，未实测，见已知坑）
    sleep 1
-   vscreen.tap (360,783)   # 再点一次防迟钝
-   sleep 3，取帧验收
+   vscreen.tap (540,1453)   # 再点一次防迟钝
+   sleep 3，取帧验收（本机 OCR 约 2 秒，验收必须做）
    ```
+   - **验收时若弹窗还开着**（袋位没变、OCR 还能看到「立即加入抽福袋」）：直接用该帧 OCR
+     测得的按钮坐标点它，并把实测坐标回填本手册（盲点值以实测为准）。
    - 失败长相：回到消费券页、袋位没变（码被别人先占，拼多多只闪小字 toast，截图看不见）→ 下一轮。
    - 成功长相：袋位翻成「立即抽福袋」（可能伴随己方队伍弹窗开着，先点 × 关掉再抽）。
    - **深链接发出前，拼多多必须停在消费券活动页**：若当前是福袋奖励商品页（标题「消费券抽福袋奖励」），
@@ -58,6 +66,7 @@
 - 加入弹窗按钮对注入点按迟钝，所以盲点两次；但弹窗已关后多余的点会落到页面上，
   两次为止，不要连点更多。
 - onekey 返回的码是全码（9 位）；`action=get&count=8` 是列表接口，onekey 更直接。
-- 每次 compose/页面改版都可能让坐标漂移：盲点坐标 (360,783) 是 720×1280 屏上
-  「立即加入抽福袋」的实测位置（图坐标 (252,548)@scale0.7），若连续两轮验收时
-  弹窗还开着，先 OCR 重新定位按钮再盲点。
+- 每次 compose/页面改版都可能让坐标漂移：旧盲点 (360,783) 是 720×1280@320 屏上的实测值；
+  2026-10-26 统一改 1080×2376@480 后，盲点按比例换算为 (540,1453)，**尚未实测**
+  （当晚校准时互助码池为空、没抢到码）。新尺寸下本机 OCR 够快，首跑务必帧帧验收：
+  弹窗未关就用 OCR 实测坐标点，并回填本手册。
