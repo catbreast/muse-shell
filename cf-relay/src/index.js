@@ -76,7 +76,67 @@ export class Relay {
     this.saveState();
   }
 
+  // ---- WebSocket Hibernation（2026-10-27 改造）----
+  // 壳改走 WS 后 DO 空闲即休眠，duration 计费趋近于零；HTTP 长轮询保留为回退，
+  // 旧版壳在用户点装新版前继续走 /poll，双协议并存不断链。
+  agentSockets() {
+    try { return this.ctx.getWebSockets(); } catch (e) { return []; }
+  }
+
+  touchWs(device) {
+    if (device) this.state.device = device;
+    this.state.last_seen = Date.now();
+    this.saveState();
+  }
+
+  deliverToSockets(cmd) {
+    for (const ws of this.agentSockets()) {
+      try { ws.send(JSON.stringify(cmd)); return true; } catch (e) { /* 换下一个 */ }
+    }
+    return false;
+  }
+
+  async webSocketMessage(ws, message) {
+    await this.load();
+    if (typeof message !== "string") return;
+    let obj;
+    try { obj = JSON.parse(message); } catch (e) { return; }
+    if (!obj || typeof obj !== "object") return;
+    let dev = null;
+    try { dev = (ws.deserializeAttachment() || {}).device || null; } catch (e) {}
+    if (obj.type === "hello") {
+      this.touchWs(obj.device || dev);
+      try { ws.send(JSON.stringify({ type: "hello_ack", ts: Date.now() })); } catch (e) {}
+      return;
+    }
+    if (obj.type === "ping") {
+      this.touchWs(dev);
+      try { ws.send(JSON.stringify({ type: "pong", ts: Date.now() })); } catch (e) {}
+      return;
+    }
+    if (obj.type === "result") {
+      this.touchWs(dev);
+      const data = (obj.result && typeof obj.result === "object") ? obj.result : obj;
+      this.deliverResult(data);
+      return;
+    }
+    if (obj.id && obj.tool && (obj.ok !== undefined || obj.error !== undefined)) {
+      this.touchWs(dev);
+      this.deliverResult(obj);
+    }
+  }
+
+  async webSocketClose(ws, code, reason, wasClean) {
+    try { ws.close(code || 1000, "closed"); } catch (e) {}
+  }
+
+  async webSocketError(ws, err) {
+    try { ws.close(1011, "error"); } catch (e) {}
+  }
+
   enqueue(cmd) {
+    // WS 在线时直接推送（DO 随即继续休眠）；否则回退长轮询等待者/持久队列
+    if (this.deliverToSockets(cmd)) return;
     // 有正在等的 /poll 就直接交付（保持 FIFO：队列非空时不会有 waiter）
     while (this.pollWaiters.length) {
       const resolve = this.pollWaiters.shift();
@@ -99,12 +159,20 @@ export class Relay {
     });
   }
 
-  waitResult(id, ms) {
+  async waitResult(id, ms) {
     if (this.results.has(id)) {
       const r = this.results.get(id);
       this.results.delete(id);
-      return Promise.resolve(r);
+      return r;
     }
+    // 休眠唤醒后内存结果已失：查落盘副本（deliverResult 无人等待时写入）
+    try {
+      const saved = await this.ctx.storage.get("res:" + id);
+      if (saved) {
+        try { await this.ctx.storage.delete("res:" + id); } catch (e) {}
+        return saved;
+      }
+    } catch (e) {}
     return new Promise((resolve) => {
       let done = false;
       const finish = (r) => { if (!done) { done = true; resolve(r); } };
@@ -118,6 +186,13 @@ export class Relay {
   deliverResult(data) {
     const id = data && data.id;
     if (!id) return;
+    // 总是落盘一份：等待者可能已随调用方断线而失效，结果被其消费后既不在
+    // 内存也不在盘上就会永久丢失；落盘后 /wait 凭 id 仍可取回（waitResult
+    // 查 res: 前缀），DO 休眠/回收同理。
+    try {
+      const p = this.ctx.storage.put("res:" + id, data);
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
     const list = this.resultWaiters.get(id);
     if (list && list.length) {
       this.resultWaiters.delete(id);
@@ -135,6 +210,29 @@ export class Relay {
     const url = new URL(req.url);
     const path = url.pathname;
     await this.load();
+
+    if (path === "/ws") {
+      if ((req.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+        return json({ error: "websocket_required" }, 426);
+      }
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+      this.ctx.acceptWebSocket(server);
+      try {
+        server.serializeAttachment({ device: req.headers.get("X-Device") || null, since: Date.now() });
+      } catch (e) {}
+      this.touch(req);
+      // 连接建立时把持久队列里的积压命令依次推给新 socket
+      let drained = 0;
+      while (this.queue.length) {
+        try { server.send(JSON.stringify(this.queue[0])); } catch (e) { break; }
+        this.queue.shift();
+        drained++;
+      }
+      if (drained) await this.saveQueue();
+      return new Response(null, { status: 101, webSocket: client });
+    }
 
     if (path.startsWith("/poll")) {
       this.touch(req);
@@ -233,11 +331,16 @@ export class Relay {
     }
 
     if (path.startsWith("/status")) {
+      const wsCount = this.agentSockets().length;
+      // WS 在线即在线：连接本身就是存活证据，不被旧 last_seen 误导
+      const seenTs = wsCount > 0 ? Date.now() : this.state.last_seen;
       return json({
         device: this.state.device,
-        last_seen_ago_sec: this.state.last_seen ? (Date.now() - this.state.last_seen) / 1000 : null,
+        last_seen_ago_sec: seenTs ? (Date.now() - seenTs) / 1000 : null,
         queued: this.queue.length,
         last_tool: this.state.last_tool,
+        ws_connected: wsCount,
+        transport: wsCount > 0 ? "websocket" : "poll",
       }, 200);
     }
 
@@ -314,7 +417,7 @@ export default {
     const path = url.pathname;
     if (path === "/") return new Response("muse phone relay (edge)\n", { status: 200 });
     const token = req.headers.get("X-Token") || "";
-    const isPhone = path.startsWith("/poll") || path.startsWith("/result");
+    const isPhone = path.startsWith("/poll") || path.startsWith("/result") || path === "/ws";
     const isAdmin = path.startsWith("/call") || path.startsWith("/wait") || path.startsWith("/status")
       || path.startsWith("/batch")
       || path === "/inbox/pending" || path === "/inbox/answer";

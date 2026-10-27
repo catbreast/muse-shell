@@ -24,6 +24,10 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+
 public class BridgeService extends Service {
     private static final String CHANNEL = "muse_bridge";
     public static volatile boolean isRunning = false;
@@ -37,6 +41,14 @@ public class BridgeService extends Service {
     static volatile boolean dispatching = false;
     private Thread supervisor;
     private PowerManager.WakeLock wakeLock;
+    // 0.7.12: WebSocket primary channel (relay Hibernation migration). While
+    // wsOpen, commands arrive on the socket and the HTTP poll loop idles;
+    // any socket failure drops back to the poll loop below, so an old relay
+    // or a dead socket never breaks the command path.
+    private volatile WebSocket relayWs = null;
+    private volatile boolean wsOpen = false;
+    private volatile long nextWsTryMs = 0;
+    private final Object dispatchLock = new Object();
 
     public static boolean isRunning() {
         return isRunning;
@@ -201,6 +213,84 @@ public class BridgeService extends Service {
         return START_STICKY;
     }
 
+    // 0.7.12: WS listener. Runs on OkHttp dispatcher threads; dispatch is
+    // serialized with the HTTP poll path through dispatchLock, and the
+    // dispatching flag keeps the supervisor stood down exactly as in loop().
+    private WebSocketListener wsListener(final ToolDispatcher dispatcher,
+                                         final String base, final String token,
+                                         final String dev) {
+        return new WebSocketListener() {
+            @Override public void onOpen(WebSocket ws, Response resp) {
+                wsOpen = true;
+                lastPollOkMs = System.currentTimeMillis();
+                try {
+                    JSONObject h = new JSONObject();
+                    h.put("type", "hello");
+                    h.put("device", dev);
+                    ws.send(h.toString());
+                } catch (Exception ignored) {
+                }
+                setNotificationText("已连接，待机");
+            }
+
+            @Override public void onMessage(WebSocket ws, String text) {
+                lastPollOkMs = System.currentTimeMillis();
+                final JSONObject obj;
+                try {
+                    obj = new JSONObject(text);
+                } catch (Exception e) {
+                    return;
+                }
+                if (obj.has("type")) return; // hello_ack / pong 等控制消息
+                dispatching = true;
+                lastPollOkMs = System.currentTimeMillis();
+                try {
+                    synchronized (dispatchLock) {
+                        JSONArray cmds = obj.optJSONArray("cmds");
+                        if (cmds != null) {
+                            for (int i = 0; i < cmds.length(); i++) {
+                                sendResultWs(ws, base, token, dev,
+                                        dispatcher.dispatch(cmds.getJSONObject(i)));
+                            }
+                        } else if (obj.has("tool")) {
+                            sendResultWs(ws, base, token, dev, dispatcher.dispatch(obj));
+                        }
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    dispatching = false;
+                }
+            }
+
+            @Override public void onClosing(WebSocket ws, int code, String reason) {
+                wsOpen = false;
+                try { ws.close(1000, null); } catch (Exception ignored) {}
+            }
+
+            @Override public void onFailure(WebSocket ws, Throwable t, Response resp) {
+                wsOpen = false;
+                if (relayWs == ws) relayWs = null;
+                nextWsTryMs = System.currentTimeMillis() + 30000;
+            }
+        };
+    }
+
+    private void sendResultWs(WebSocket ws, String base, String token, String dev,
+                              JSONObject result) {
+        try {
+            JSONObject wrap = new JSONObject();
+            wrap.put("type", "result");
+            wrap.put("result", result);
+            if (wsOpen && ws.send(wrap.toString())) return;
+        } catch (Exception ignored) {
+        }
+        // WS 回填失败回退 HTTP，结果不丢
+        try {
+            HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
+        } catch (Exception ignored) {
+        }
+    }
+
     private void loop() {
         ToolDispatcher dispatcher = new ToolDispatcher(this);
         long backoff = 2000;
@@ -214,6 +304,31 @@ public class BridgeService extends Service {
                 String base = Prefs.baseUrl(this);
                 String token = Prefs.token(this);
                 String dev = Prefs.deviceId(this);
+                // 0.7.12: WS 优先。连接存活时本循环只做存活打点（监管线程据此
+                // 判活），不再发 HTTP 长轮询；断线则落回下面的轮询路径顶着，
+                // 每 30 秒重试一次 WS。
+                if (wsOpen) {
+                    lastPollOkMs = System.currentTimeMillis();
+                    Thread.sleep(1000);
+                    continue;
+                }
+                if (relayWs == null && System.currentTimeMillis() >= nextWsTryMs) {
+                    try {
+                        relayWs = HttpUtil.connectWs(base, token, dev,
+                                wsListener(dispatcher, base, token, dev));
+                        // 给握手最多 10 秒；连上后下一轮进入 WS 待机
+                        for (int i = 0; i < 50 && running && !wsOpen; i++) {
+                            Thread.sleep(200);
+                        }
+                        if (wsOpen) continue;
+                        try { relayWs.close(1000, "handshake_timeout"); } catch (Exception ignored) {}
+                        relayWs = null;
+                        nextWsTryMs = System.currentTimeMillis() + 30000;
+                    } catch (Exception e) {
+                        relayWs = null;
+                        nextWsTryMs = System.currentTimeMillis() + 30000;
+                    }
+                }
                 // 0.7.10: ?n=8 让中继在有一批待办时一次返回多条（{cmds:[...]}），
                 // 连环操作不用每条都等一轮长轮询；旧中继忽略该参数、仍返回单条。
                 HttpUtil.Resp r = HttpUtil.request("GET", base + "/poll?n=8", token, dev, null, 10000, 40000);
@@ -246,16 +361,18 @@ public class BridgeService extends Service {
                 dispatching = true;
                 lastPollOkMs = System.currentTimeMillis();
                 try {
-                    JSONArray cmds = first.optJSONArray("cmds");
-                    if (cmds != null) {
-                        // 0.7.10 批量：按到达顺序逐条执行、逐条回结果
-                        for (int i = 0; i < cmds.length(); i++) {
-                            JSONObject result = dispatcher.dispatch(cmds.getJSONObject(i));
+                    synchronized (dispatchLock) {
+                        JSONArray cmds = first.optJSONArray("cmds");
+                        if (cmds != null) {
+                            // 0.7.10 批量：按到达顺序逐条执行、逐条回结果
+                            for (int i = 0; i < cmds.length(); i++) {
+                                JSONObject result = dispatcher.dispatch(cmds.getJSONObject(i));
+                                HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
+                            }
+                        } else {
+                            JSONObject result = dispatcher.dispatch(first);
                             HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
                         }
-                    } else {
-                        JSONObject result = dispatcher.dispatch(first);
-                        HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
                     }
                 } finally {
                     dispatching = false;
@@ -332,6 +449,11 @@ public class BridgeService extends Service {
     public void onDestroy() {
         isRunning = false;
         running = false;
+        wsOpen = false;
+        if (relayWs != null) {
+            try { relayWs.close(1000, "service_destroy"); } catch (Exception ignored) {}
+            relayWs = null;
+        }
         if (worker != null) worker.interrupt();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         // Replace whatever live state was showing (often "连接中断，重连中…",

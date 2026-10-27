@@ -19,6 +19,8 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
 
 /**
  * Relay HTTP on OkHttp (0.6.11; was HttpURLConnection up to 0.6.10).
@@ -114,5 +116,32 @@ public class HttpUtil {
         } finally {
             if (inFlight == call) inFlight = null;
         }
+    }
+
+    // WebSocket relay channel (0.7.12): the primary command path after the
+    // relay's Hibernation migration. Protocol ping/pong every 45 s is handled
+    // by OkHttp + the edge and does not wake the Durable Object; only real
+    // commands/results cost DO duration. Callers must fall back to the HTTP
+    // poll loop above whenever the socket is not open (BridgeService does).
+    public static WebSocket connectWs(String baseUrl, String token, String deviceId,
+                                      WebSocketListener listener) {
+        String wsUrl;
+        if (baseUrl.startsWith("https://")) {
+            wsUrl = "wss://" + baseUrl.substring("https://".length()) + "/ws";
+        } else if (baseUrl.startsWith("http://")) {
+            wsUrl = "ws://" + baseUrl.substring("http://".length()) + "/ws";
+        } else {
+            wsUrl = baseUrl + "/ws";
+        }
+        Request req = new Request.Builder()
+                .url(wsUrl)
+                .header("X-Token", token == null ? "" : token)
+                .header("X-Device", deviceId == null ? "" : deviceId)
+                .build();
+        OkHttpClient client = BASE.newBuilder()
+                .dns(DNS_WITH_TIMEOUT)
+                .pingInterval(45, TimeUnit.SECONDS)
+                .build();
+        return client.newWebSocket(req, listener);
     }
 }
