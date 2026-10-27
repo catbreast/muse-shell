@@ -2,7 +2,6 @@ package app.ruisnow.muse.hook;
 
 import android.app.Notification;
 import android.content.Context;
-import android.content.Intent;
 import android.os.Bundle;
 import android.os.Environment;
 import android.util.Log;
@@ -74,7 +73,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public class BreenoHook extends XposedModule {
     private static final String TAG = "MuseHook";
     private static final String TARGET_PKG = "com.heytap.speechassist";
-    private static final String SPEECH_SERVICE = "com.heytap.speechassist.core.SpeechService";
     private static final String DATA_CENTER = "com.heytap.speechassist.aichat.AIChatDataCenter";
     private static final String VIEW_BEAN = "com.heytap.speechassist.aichat.bean.AIChatViewBean";
     private static final String MQM = "com.heytap.speech.engine.connect.core.manager.MessageQueueManager";
@@ -112,8 +110,6 @@ public class BreenoHook extends XposedModule {
     private volatile long lastTextTs = 0;
     private volatile long takeoverCacheTs = 0;
     private volatile boolean takeoverCache = true;
-    private volatile long powerCacheTs = 0;
-    private volatile boolean powerCache = true;
     private volatile boolean housekeeperStarted = false;
 
     @Override
@@ -124,33 +120,23 @@ public class BreenoHook extends XposedModule {
         // 2026-10-26 (user order): the conversation hooks (dispatch / outbound
         // / inbound / notifications) and the housekeeper are NO LONGER
         // installed — Breeno conversations are not hooked at all. Their code
-        // remains below, inert, for history. Only the power-key hijack stays:
-        // it intercepts the SpeechService activation start, not conversations.
+        // remains below, inert, for history.
+        // 2026-10-28 (0.7.13, user order): the power-key hijack is REMOVED too —
+        // a dedicated Xposed module now wakes Muse on power long-press.
+        // Only the screen-recognition safe-layer bypass remains installed.
         // (The file-based takeover switch never reliably reached this
         // process — scoped storage blocks the read and the fallback defaults
         // to ON — which is why removing the installs is the definitive off.)
         int installed = 0;
         try {
-            installed += hookPowerKey(cl);
             installed += hookSafeLayer(cl);
         } catch (Throwable t) {
-            xlog("powerkey install failed: " + t);
+            xlog("hook install failed: " + t);
         }
         xlog("hooks installed=" + installed + " in " + param.getPackageName());
     }
 
     // ================= hooks =================
-
-    // ---- power key hijack: power long-press wakes Muse instead of Breeno ----
-    // ColorOS wakes Breeno on power long-press by starting SpeechService with
-    // action heytap.intent.action.ACTIVATE_SPEECH_ASSIST (dumpsys evidence).
-    // We log every start (canary + jsonl, for signature retargeting), and when
-    // the activation action arrives we launch Muse and swallow the start so
-    // Breeno's own handling (and UI) never runs.
-    // Switch: /sdcard/MuseShell/powerkey_muse ("0" = off; absent or "1" = on).
-    private static final String ACTION_ACTIVATE_SPEECH =
-            "heytap.intent.action.ACTIVATE_SPEECH_ASSIST";
-    private static volatile long lastHijackTs = 0;
 
     // ---- screen-recognition safe-layer bypass (user order 2026-10-26) ----
     // Breeno's screen recognition (识屏/圈选: CUI float window + SmartScreenView)
@@ -214,95 +200,6 @@ public class BreenoHook extends XposedModule {
         return n;
     }
 
-    private int hookPowerKey(ClassLoader cl) {
-        int n = 0;
-        try {
-            Class<?> svc = Class.forName(SPEECH_SERVICE, false, cl);
-            // SpeechService may inherit onCreate/onStartCommand from a base
-            // class; walk the hierarchy and hook the declaring methods.
-            Method onCreate = findMethodInHierarchy(svc, "onCreate");
-            if (onCreate != null && onCreate.getReturnType() == void.class) {
-                hook(onCreate).intercept(new XposedInterface.Hooker() {
-                    @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                        canary("svc_oncreate");
-                        return chain.proceed();
-                    }
-                });
-                n++;
-            }
-            Method onStart = findMethodInHierarchy(svc, "onStartCommand",
-                    Intent.class, int.class, int.class);
-            if (onStart != null && onStart.getReturnType() == int.class) {
-                hook(onStart).intercept(new XposedInterface.Hooker() {
-                    @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                        List<Object> a = chain.getArgs();
-                        Intent in = a.isEmpty() ? null : (Intent) a.get(0);
-                        if (powerKeyOn()) {
-                            canary("powerkey_start " + describeIntent(in));
-                            appendFile("{\"event\":\"powerkey_start\",\"intent\":\""
-                                    + esc(describeIntent(in)) + "\"}");
-                            if (in != null && ACTION_ACTIVATE_SPEECH.equals(in.getAction())) {
-                                // One power press can start SpeechService more
-                                // than once (multiple Breeno processes / sticky
-                                // redelivery). Launch at most once per 2.5s;
-                                // extra starts are swallowed silently so Muse
-                                // is not re-fronted with a stray animation.
-                                long now = System.currentTimeMillis();
-                                if (now - lastHijackTs < 2500) {
-                                    return Integer.valueOf(1);
-                                }
-                                Object self = chain.getThisObject();
-                                if (self instanceof Context
-                                        && launchMuse((Context) self)) {
-                                    lastHijackTs = now;
-                                    canary("powerkey_hijack_ok");
-                                    appendFile("{\"event\":\"powerkey_hijack\"}");
-                                    // Swallow: Breeno never sees the activation.
-                                    return Integer.valueOf(1);
-                                }
-                                canary("powerkey_hijack_launch_failed");
-                            }
-                        }
-                        return chain.proceed();
-                    }
-                });
-                n++;
-            }
-            canary("powerkey_install_ok n=" + n);
-        } catch (Throwable t) {
-            canary("powerkey_install_fail " + t.getClass().getName() + ": " + t.getMessage());
-        }
-        return n;
-    }
-
-    private static Method findMethodInHierarchy(Class<?> cls, String name, Class<?>... params) {
-        for (Class<?> c = cls; c != null; c = c.getSuperclass()) {
-            try {
-                Method m = c.getDeclaredMethod(name, params);
-                m.setAccessible(true);
-                return m;
-            } catch (NoSuchMethodException ignored) {}
-        }
-        return null;
-    }
-
-    private static boolean launchMuse(Context ctx) {
-        try {
-            Intent open = ctx.getPackageManager().getLaunchIntentForPackage("com.facebook.aura");
-            if (open == null) {
-                open = new Intent(Intent.ACTION_MAIN);
-                open.setComponent(new android.content.ComponentName(
-                        "com.facebook.aura", "com.facebook.aura.main.AuraMainActivity"));
-            }
-            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                    | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
-            ctx.startActivity(open);
-            return true;
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
     // Diagnostic canary: plain file write that does not depend on the host
     // app's context, so a callback/install failure is always visible.
     private static synchronized void canary(String msg) {
@@ -314,52 +211,6 @@ public class BreenoHook extends XposedModule {
             w.write(ts + " " + msg + "\n");
             w.close();
         } catch (Throwable ignored) {}
-    }
-
-    private static String describeIntent(Intent in) {
-        if (in == null) return "null";
-        StringBuilder sb = new StringBuilder();
-        sb.append("action=").append(in.getAction());
-        sb.append(" cmp=").append(in.getComponent() == null
-                ? "-" : in.getComponent().flattenToShortString());
-        sb.append(" flags=0x").append(Integer.toHexString(in.getFlags()));
-        Bundle b = in.getExtras();
-        if (b != null) {
-            for (String k : b.keySet()) {
-                Object v = null;
-                try { v = b.get(k); } catch (Throwable ignored) {}
-                sb.append(" | ").append(k).append("=");
-                if (v == null) {
-                    sb.append("null");
-                } else if (v instanceof String || v instanceof Number || v instanceof Boolean) {
-                    String s = String.valueOf(v);
-                    sb.append(s.length() > 120 ? s.substring(0, 120) : s);
-                } else {
-                    sb.append("<").append(v.getClass().getSimpleName()).append(">");
-                }
-            }
-        }
-        return sb.toString();
-    }
-
-    private boolean powerKeyOn() {
-        long now = System.currentTimeMillis();
-        if (now - powerCacheTs < 5000) return powerCache;
-        powerCacheTs = now;
-        boolean on = true;
-        try {
-            File f = new File(Environment.getExternalStorageDirectory(), "MuseShell/powerkey_muse");
-            if (f.exists()) {
-                BufferedReader r = new BufferedReader(new FileReader(f));
-                String v = r.readLine();
-                r.close();
-                on = v == null || !"0".equals(v.trim());
-            }
-        } catch (Throwable ignored) {
-            on = true;
-        }
-        powerCache = on;
-        return on;
     }
 
     private int hookDispatch(ClassLoader cl) throws Exception {
