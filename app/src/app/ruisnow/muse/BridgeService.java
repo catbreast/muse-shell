@@ -24,6 +24,11 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import okhttp3.Response;
 import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
@@ -48,7 +53,67 @@ public class BridgeService extends Service {
     private volatile WebSocket relayWs = null;
     private volatile boolean wsOpen = false;
     private volatile long nextWsTryMs = 0;
-    private final Object dispatchLock = new Object();
+    // 0.7.14: multi-lane dispatch. Until 0.7.13 every command ran serially
+    // on the worker/WS-callback thread, so one command that never returned
+    // (e.g. a pm install held by the system) starved the whole channel
+    // while heartbeats stayed green and the supervisor stood down. Now
+    // each command runs on a lane thread and posts its own result; a
+    // wedged lane costs one thread, never the channel. browser.* keeps a
+    // single dedicated lane: its snapshot refs and page state assume
+    // sequential execution. Note: commands from one batch may now finish
+    // out of order; the relay matches results by call id.
+    private final AtomicInteger inFlight = new AtomicInteger(0);
+    private final ExecutorService lanes = Executors.newFixedThreadPool(4, laneFactory("muse-lane"));
+    private final ExecutorService browserLane = Executors.newSingleThreadExecutor(laneFactory("muse-browser-lane"));
+
+    private static ThreadFactory laneFactory(final String name) {
+        return new ThreadFactory() {
+            private final AtomicInteger seq = new AtomicInteger(0);
+
+            @Override public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, name + "-" + seq.incrementAndGet());
+                t.setDaemon(true);
+                return t;
+            }
+        };
+    }
+
+    // Run one command on its lane and post the result when it finishes.
+    // ws != null: the command arrived on that socket (sendResultWs falls
+    // back to HTTP if the socket has since closed). ws == null: HTTP poll
+    // path, result goes back by HTTP, exactly as the serial code did.
+    private void submit(final ToolDispatcher dispatcher, final WebSocket ws,
+                        final String base, final String token, final String dev,
+                        final JSONObject cmd) {
+        inFlight.incrementAndGet();
+        dispatching = true;
+        lastPollOkMs = System.currentTimeMillis();
+        String tool = cmd.optString("tool", "");
+        ExecutorService lane = tool.startsWith("browser.") ? browserLane : lanes;
+        try {
+            lane.execute(new Runnable() {
+                @Override public void run() {
+                    try {
+                        JSONObject result = dispatcher.dispatch(cmd);
+                        if (ws != null) {
+                            sendResultWs(ws, base, token, dev, result);
+                        } else {
+                            try {
+                                HttpUtil.request("POST", base + "/result", token, dev,
+                                        result.toString(), 10000, 15000);
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    } catch (Exception ignored) {
+                    } finally {
+                        if (inFlight.decrementAndGet() <= 0) dispatching = false;
+                    }
+                }
+            });
+        } catch (Exception e) {
+            if (inFlight.decrementAndGet() <= 0) dispatching = false;
+        }
+    }
 
     public static boolean isRunning() {
         return isRunning;
@@ -213,9 +278,10 @@ public class BridgeService extends Service {
         return START_STICKY;
     }
 
-    // 0.7.12: WS listener. Runs on OkHttp dispatcher threads; dispatch is
-    // serialized with the HTTP poll path through dispatchLock, and the
-    // dispatching flag keeps the supervisor stood down exactly as in loop().
+    // 0.7.12: WS listener. Runs on OkHttp dispatcher threads.
+    // 0.7.14: onMessage only submits to the dispatch lanes (see submit());
+    // the dispatching flag is maintained per in-flight command and keeps
+    // the supervisor stood down exactly as in loop().
     private WebSocketListener wsListener(final ToolDispatcher dispatcher,
                                          final String base, final String token,
                                          final String dev) {
@@ -242,23 +308,19 @@ public class BridgeService extends Service {
                     return;
                 }
                 if (obj.has("type")) return; // hello_ack / pong 等控制消息
-                dispatching = true;
-                lastPollOkMs = System.currentTimeMillis();
+                // 0.7.14: hand each command to a lane and return at once;
+                // blocking this OkHttp callback on a dispatch was the old
+                // serial bottleneck.
                 try {
-                    synchronized (dispatchLock) {
-                        JSONArray cmds = obj.optJSONArray("cmds");
-                        if (cmds != null) {
-                            for (int i = 0; i < cmds.length(); i++) {
-                                sendResultWs(ws, base, token, dev,
-                                        dispatcher.dispatch(cmds.getJSONObject(i)));
-                            }
-                        } else if (obj.has("tool")) {
-                            sendResultWs(ws, base, token, dev, dispatcher.dispatch(obj));
+                    JSONArray cmds = obj.optJSONArray("cmds");
+                    if (cmds != null) {
+                        for (int i = 0; i < cmds.length(); i++) {
+                            submit(dispatcher, ws, base, token, dev, cmds.getJSONObject(i));
                         }
+                    } else if (obj.has("tool")) {
+                        submit(dispatcher, ws, base, token, dev, obj);
                     }
                 } catch (Exception ignored) {
-                } finally {
-                    dispatching = false;
                 }
             }
 
@@ -353,29 +415,23 @@ public class BridgeService extends Service {
                 JSONObject first = new JSONObject(r.body);
                 // The wake lock is held for the service lifetime (onCreate);
                 // the old per-dispatch acquire/release would have dropped it.
-                // 0.6.10 (agy review P0-2): a command may run for minutes and
-                // loop() cannot poll meanwhile — stamp the receipt as proof
-                // of life and flag the dispatch so the supervisor stands
-                // down until it finishes; otherwise it kills the process
-                // mid-task and the result never reaches the relay.
-                dispatching = true;
-                lastPollOkMs = System.currentTimeMillis();
+                // 0.6.10 (agy review P0-2): a command may run for minutes —
+                // stamp the receipt as proof of life and flag the dispatch
+                // so the supervisor stands down; otherwise it kills the
+                // process mid-task and the result never reaches the relay.
+                // 0.7.14: submit() keeps that flag per in-flight command
+                // (see inFlight) while this loop polls on immediately.
                 try {
-                    synchronized (dispatchLock) {
-                        JSONArray cmds = first.optJSONArray("cmds");
-                        if (cmds != null) {
-                            // 0.7.10 批量：按到达顺序逐条执行、逐条回结果
-                            for (int i = 0; i < cmds.length(); i++) {
-                                JSONObject result = dispatcher.dispatch(cmds.getJSONObject(i));
-                                HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
-                            }
-                        } else {
-                            JSONObject result = dispatcher.dispatch(first);
-                            HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
+                    JSONArray cmds = first.optJSONArray("cmds");
+                    if (cmds != null) {
+                        // 0.7.10 批量：逐条提交到通道，各自完成时回结果
+                        for (int i = 0; i < cmds.length(); i++) {
+                            submit(dispatcher, null, base, token, dev, cmds.getJSONObject(i));
                         }
+                    } else {
+                        submit(dispatcher, null, base, token, dev, first);
                     }
-                } finally {
-                    dispatching = false;
+                } catch (Exception ignored) {
                 }
                 setNotificationText("已连接，待机");
             } catch (Exception e) {
@@ -455,6 +511,8 @@ public class BridgeService extends Service {
             relayWs = null;
         }
         if (worker != null) worker.interrupt();
+        lanes.shutdownNow();
+        browserLane.shutdownNow();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         // Replace whatever live state was showing (often "连接中断，重连中…",
         // posted by the dying worker) with a final, dismissible stopped
