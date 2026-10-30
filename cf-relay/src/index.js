@@ -128,7 +128,23 @@ export class Relay {
     let changed = false;
     for (const id of ids) {
       const e = this.inflight[id];
-      if (!live.has(e.tag) && Date.now() - (e.at || 0) > 20000) {
+      const age = Date.now() - (e.at || 0);
+      // root-role executors ack on receipt: unacked after 45s means the
+      // frame died in transit — requeue even if the socket looks alive.
+      // Acked but resultless after 240s means execution died mid-flight;
+      // executor dedup (executed ledger / outbox) makes redelivery safe.
+      const lostInTransit = e.cmd.role === "root" && !e.acked && age > 45000;
+      const diedMidFlight = e.cmd.role === "root" && e.acked && age > 240000;
+      if (lostInTransit || diedMidFlight) {
+        delete this.inflight[id];
+        changed = true;
+        if (!this.deliverToSockets(e.cmd)) {
+          this.queue.unshift(e.cmd);
+          await this.saveQueue();
+        }
+        continue;
+      }
+      if (!live.has(e.tag) && age > 20000) {
         delete this.inflight[id];
         changed = true;
         if (!this.deliverToSockets(e.cmd)) {
@@ -193,6 +209,12 @@ export class Relay {
         this.saveState();
       }
       try { ws.send(JSON.stringify({ type: "pong", ts: Date.now() })); } catch (e) {}
+      return;
+    }
+    if (obj.type === "cmd_ack") {
+      this.touchWs(dev);
+      const e = this.inflight[obj.id];
+      if (e && !e.acked) { e.acked = Date.now(); await this.saveInflight(); }
       return;
     }
     if (obj.type === "result") {

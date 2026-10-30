@@ -30,6 +30,16 @@ MAX_EXECUTED = 300
 os.makedirs(OUTBOX, exist_ok=True)
 
 
+# Force IPv4: this phone's IPv6 route to Cloudflare blackholes the same
+# way the PC's did (TCP/TLS stalls while IPv4 is fine). The PC agent got
+# the same cure (forced tcp4); without it the agent's TLS handshakes to
+# the relay time out in bursts while the Android app connects fine.
+import socket as _sock
+_orig_gai = _sock.getaddrinfo
+def _gai4(host, port, family=0, *a, **kw):
+    return _orig_gai(host, port, _sock.AF_INET, *a, **kw)
+_sock.getaddrinfo = _gai4
+
 def log(msg):
     line = time.strftime("%F %T") + " " + str(msg)
     try:
@@ -265,6 +275,14 @@ def main():
                     if obj.get("type") == "result_ack":
                         outbox_ack(obj.get("id", ""))
                     elif obj.get("id") and obj.get("tool"):
+                        # Receipt ack FIRST: the relay requeues unacked
+                        # commands — without it a frame lost in a flap (or
+                        # an executor thread stuck on a hung subprocess)
+                        # strands the command with both ends looking fine.
+                        try:
+                            ws.send(json.dumps({"type": "cmd_ack", "id": obj["id"]}))
+                        except Exception:
+                            pass
                         pool.submit(execute, obj, send_result)
                 if time.time() - last_ping > 25:
                     last_ping = time.time()
