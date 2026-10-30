@@ -127,7 +127,7 @@ phone.py call linux.exec '{"cmd":"python3 /root/muse_ocr.py /mnt/sdcard/MuseShel
   - 应用：`android.launch/packages/install/uninstall/force_stop/clear/setting/input`
     （`android.launch` 的参数名是 `package` 不是 `pkg`）
   - 虚拟屏：`vscreen.create/launch/status/see/tap/swipe/key/preview/close`
-  - 浏览器：`browser.open/snapshot/find/click/type/read`
+  - 浏览器：`browser.open/snapshot/find/click/type/read`、`browser.batch`（0.7.15：一次下发多步在设备端顺序执行；步骤 `do` 可为 open/find/click/type/read/snapshot/sleep 与等待条件 wait_text/wait_url/wait_quiet；find 以 `as` 命名 ref、后续步用 `$名字` 引用，缺省存 `$last`；默认失败即停并回 stopped_at，每步只回紧凑摘要，全批上限 30 步/120 秒）
   - 容器：`linux.status` `linux.exec`（输出封顶约 4500 字）
   - 权限：`privilege.status/request/mode`（Shizuku 等）
 - 每次调用都记账本；排障时先看账本尾部，比猜快。

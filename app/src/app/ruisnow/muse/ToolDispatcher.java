@@ -196,6 +196,7 @@ public class ToolDispatcher {
         if (tool.equals("browser.click")) return browserClick(a, cmdId);
         if (tool.equals("browser.type")) return browserType(a, cmdId);
         if (tool.equals("browser.read")) return browserRead(a);
+        if (tool.equals("browser.batch")) return browserBatch(a);
         if (tool.equals("vscreen.create")) return VScreenManager.get(ctx).create(a);
         if (tool.equals("vscreen.status")) return VScreenManager.get(ctx).status();
         if (tool.equals("vscreen.launch")) return VScreenManager.get(ctx).launch(a);
@@ -312,6 +313,12 @@ public class ToolDispatcher {
     private JSONObject browserRead(JSONObject a) throws Exception {
         needBrowser();
         return BrowserHost.get(ctx).read(a.optString("ref", ""));
+    }
+
+    private JSONObject browserBatch(JSONObject a) throws Exception {
+        needBrowser();
+        // 与 click/type 同口径（2026-10-22 用户定）：默认允许、不弹审批卡
+        return BrowserHost.get(ctx).batch(a);
     }
 
     private void needBrowser() throws Exception {

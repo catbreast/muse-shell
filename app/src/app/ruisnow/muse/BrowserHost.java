@@ -21,6 +21,7 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -578,6 +579,242 @@ public class BrowserHost {
             o.put("text", capped);
         }
         return o;
+    }
+
+    // ---------------- 复合动作（0.7.15，借鉴 Mika 的「一次多步+等待条件」） ----------------
+    //
+    // browser.batch：一次下发一串步骤，设备端顺序执行，省掉每步一次中继往返。
+    // 步骤（args.steps 数组，每步一个对象，字段 do 指明动作）：
+    //   open{url} / find{query,role,as} / click{ref} / type{ref,text} / read{ref?}
+    //   snapshot{text?} / sleep{ms}
+    //   wait_text{text,timeout_ms} / wait_url{contains,timeout_ms}
+    //   wait_quiet{quiet_ms,timeout_ms}（页面指纹与 DOM 变更计数持续安静 quiet_ms 才算过）
+    // find 命中的第一个候选 ref 存进变量表：as 指定名字（缺省存 $last），
+    // 后续步骤 ref 写 "$名字" 引用。find 无候选视为该步失败。
+    // 默认 stop_on_error=true：某步失败即停，返回 stopped_at 与已完成步骤的结果；
+    // 每步结果只回紧凑摘要（完整节点/正文用 browser.snapshot / browser.read 单独取，
+    // ref 跨调用稳定）。全批上限 30 步 / 总时长 120 秒，结果 JSON 按 4500 字节封顶。
+
+    public JSONObject batch(JSONObject args) throws Exception {
+        JSONArray steps = args.optJSONArray("steps");
+        if (steps == null || steps.length() == 0) {
+            throw new Exception("browser_batch_empty: steps 为空");
+        }
+        if (steps.length() > 30) {
+            throw new Exception("browser_batch_too_long: 最多 30 步");
+        }
+        boolean stopOnError = args.optBoolean("stop_on_error", true);
+        Map<String, String> vars = new HashMap<String, String>();
+        JSONArray results = new JSONArray();
+        long deadline = System.currentTimeMillis() + 120000;
+        int stoppedAt = -1;
+        String error = null;
+        for (int i = 0; i < steps.length(); i++) {
+            JSONObject rec = new JSONObject();
+            rec.put("i", i);
+            if (System.currentTimeMillis() > deadline) {
+                rec.put("do", steps.getJSONObject(i).optString("do"));
+                rec.put("ok", false);
+                rec.put("error", "batch_deadline_120s");
+                results.put(rec);
+                stoppedAt = i;
+                error = "batch_deadline_120s";
+                break;
+            }
+            JSONObject st = steps.getJSONObject(i);
+            String action = st.optString("do");
+            rec.put("do", action);
+            long t0 = System.currentTimeMillis();
+            try {
+                JSONObject detail = runBatchStep(action, st, vars);
+                rec.put("ok", true);
+                if (detail != null) rec.put("detail", detail);
+            } catch (Exception e) {
+                rec.put("ok", false);
+                rec.put("error", String.valueOf(e.getMessage()));
+                rec.put("ms", System.currentTimeMillis() - t0);
+                results.put(rec);
+                if (stopOnError) {
+                    stoppedAt = i;
+                    error = String.valueOf(e.getMessage());
+                    break;
+                }
+                continue;
+            }
+            rec.put("ms", System.currentTimeMillis() - t0);
+            results.put(rec);
+        }
+        JSONObject o = new JSONObject();
+        o.put("ok", stoppedAt < 0);
+        o.put("done", results.length());
+        if (stoppedAt >= 0) {
+            o.put("stopped_at", stoppedAt);
+            o.put("error", error);
+        }
+        o.put("steps", results);
+        // 体积封顶：从最后一步开始把 detail 换成占位，直到落进 4500 字节
+        for (int i = results.length() - 1; i >= 0
+                && o.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 4500; i--) {
+            JSONObject rec = results.getJSONObject(i);
+            if (rec.has("detail")) {
+                rec.remove("detail");
+                rec.put("detail_trimmed", true);
+            }
+        }
+        return o;
+    }
+
+    private JSONObject runBatchStep(String action, JSONObject st, Map<String, String> vars)
+            throws Exception {
+        if ("open".equals(action)) {
+            JSONObject r = open(st.getString("url"));
+            JSONObject d = new JSONObject();
+            d.put("url", r.optString("url"));
+            d.put("title", r.optString("title"));
+            return d;
+        }
+        if ("find".equals(action)) {
+            JSONObject r = find(st.optString("query", ""), st.optString("role", ""));
+            JSONArray cands = r.optJSONArray("candidates");
+            if (cands == null || cands.length() == 0) {
+                throw new Exception("browser_batch_find_empty: " + st.optString("query", ""));
+            }
+            JSONObject first = cands.getJSONObject(0);
+            String ref = first.getString("ref");
+            vars.put("last", ref);
+            String as = st.optString("as", "");
+            if (!as.isEmpty()) vars.put(as, ref);
+            JSONObject d = new JSONObject();
+            d.put("found", r.optInt("found"));
+            d.put("ref", ref);
+            d.put("name", first.optString("name"));
+            return d;
+        }
+        if ("click".equals(action)) {
+            JSONObject r = click(resolveRef(st.getString("ref"), vars));
+            JSONObject d = new JSONObject();
+            d.put("changed", r.optBoolean("changed"));
+            d.put("via", r.optString("via"));
+            if (r.has("url")) d.put("url", r.optString("url"));
+            if (r.has("newNames")) d.put("newNames", r.getJSONArray("newNames"));
+            return d;
+        }
+        if ("type".equals(action)) {
+            JSONObject r = type(resolveRef(st.getString("ref"), vars), st.optString("text", ""));
+            JSONObject d = new JSONObject();
+            d.put("changed", r.optBoolean("changed"));
+            d.put("via", r.optString("via"));
+            if (r.has("value")) d.put("value", capBytes(r.optString("value"), 200));
+            return d;
+        }
+        if ("snapshot".equals(action)) {
+            JSONObject r = snapshotFull(st.optBoolean("text", false));
+            JSONObject d = new JSONObject();
+            d.put("url", r.optString("url"));
+            d.put("title", r.optString("title"));
+            d.put("count", r.optInt("count"));
+            if (r.has("diff")) d.put("diff", r.getJSONObject("diff"));
+            return d;
+        }
+        if ("read".equals(action)) {
+            String ref = st.optString("ref", "");
+            if (!ref.isEmpty()) ref = resolveRef(ref, vars);
+            JSONObject r = read(ref);
+            JSONObject d = new JSONObject();
+            d.put("ok", r.optBoolean("ok", true));
+            if (r.has("text")) d.put("text", capBytes(r.optString("text"), 1000));
+            if (r.has("value")) d.put("value", capBytes(r.optString("value"), 300));
+            return d;
+        }
+        if ("wait_text".equals(action)) {
+            String text = st.getString("text");
+            long end = System.currentTimeMillis() + st.optLong("timeout_ms", 10000);
+            while (System.currentTimeMillis() < end) {
+                if (pageHasText(text)) {
+                    JSONObject d = new JSONObject();
+                    d.put("found", true);
+                    return d;
+                }
+                Thread.sleep(300);
+            }
+            throw new Exception("wait_text_timeout: " + text);
+        }
+        if ("wait_url".equals(action)) {
+            String contains = st.getString("contains");
+            long end = System.currentTimeMillis() + st.optLong("timeout_ms", 10000);
+            while (System.currentTimeMillis() < end) {
+                String u = currentUrl();
+                if (u.contains(contains)) {
+                    JSONObject d = new JSONObject();
+                    d.put("url", u);
+                    return d;
+                }
+                Thread.sleep(300);
+            }
+            throw new Exception("wait_url_timeout: " + contains);
+        }
+        if ("wait_quiet".equals(action)) {
+            long quietMs = st.optLong("quiet_ms", 600);
+            long end = System.currentTimeMillis() + st.optLong("timeout_ms", 12000);
+            String lastFp = fingerprint(); // FP_JS 内含 JS_LIB，顺带装上变更计数器
+            long lastMut = mutationCount();
+            long stableSince = System.currentTimeMillis();
+            while (System.currentTimeMillis() < end) {
+                Thread.sleep(200);
+                String fp = fingerprint();
+                long m = mutationCount();
+                if (!fp.equals(lastFp) || m != lastMut) {
+                    lastFp = fp;
+                    lastMut = m;
+                    stableSince = System.currentTimeMillis();
+                } else if (System.currentTimeMillis() - stableSince >= quietMs) {
+                    JSONObject d = new JSONObject();
+                    d.put("quiet", true);
+                    return d;
+                }
+            }
+            throw new Exception("wait_quiet_timeout");
+        }
+        if ("sleep".equals(action)) {
+            Thread.sleep(Math.min(st.optLong("ms", 500), 10000));
+            return null;
+        }
+        throw new Exception("browser_batch_bad_step: " + action);
+    }
+
+    private String resolveRef(String ref, Map<String, String> vars) throws Exception {
+        if (ref != null && ref.startsWith("$")) {
+            String v = vars.get(ref.substring(1));
+            if (v == null) throw new Exception("browser_batch_unbound_var: " + ref);
+            return v;
+        }
+        return ref;
+    }
+
+    private boolean pageHasText(String text) throws Exception {
+        if (wv == null) throw new Exception("browser_not_open: 先用 browser.open 打开页面");
+        String js = "(function(){var t=(document.body&&document.body.innerText)||'';"
+                + "return JSON.stringify({hit:t.indexOf(" + JSONObject.quote(text) + ")>=0});})()";
+        return new JSONObject(eval(js, 8000)).optBoolean("hit");
+    }
+
+    private String currentUrl() {
+        try {
+            String u = eval("(function(){return location.href||'';})()", 6000);
+            return u == null ? "" : u;
+        } catch (Exception e) {
+            return lastUrl;
+        }
+    }
+
+    private long mutationCount() {
+        try {
+            JSONObject o = new JSONObject(eval(
+                    "(function(){return JSON.stringify({m:window.__museMut||0});})()", 6000));
+            return o.optLong("m", -1);
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     /** 按 UTF-8 字节预算截断字符串（中继通道体积上限约 7KB，留足余量）。 */
