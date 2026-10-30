@@ -109,8 +109,16 @@ export class Relay {
 
   deliverToSockets(cmd) {
     const role = cmd.role || "app";
-    for (const ws of this.socketsByRole(role)) {
-      try { ws.send(JSON.stringify(cmd)); return true; } catch (e) { /* 换下一个 */ }
+    // Freshest socket first: a frozen/thawed client leaves a half-dead
+    // socket that accepts send() silently — delivering to it strands the
+    // command. lastSeen is stamped on every inbound message (see below).
+    const cands = this.socketsByRole(role).map((ws) => {
+      let seen = 0;
+      try { const a = ws.deserializeAttachment() || {}; seen = a.lastSeen || a.since || 0; } catch (e) {}
+      return { ws, seen };
+    }).sort((x, y) => y.seen - x.seen);
+    for (const c of cands) {
+      try { c.ws.send(JSON.stringify(cmd)); return true; } catch (e) { /* 换下一个 */ }
     }
     return false;
   }
@@ -122,7 +130,12 @@ export class Relay {
     try { obj = JSON.parse(message); } catch (e) { return; }
     if (!obj || typeof obj !== "object") return;
     let dev = null;
-    try { dev = (ws.deserializeAttachment() || {}).device || null; } catch (e) {}
+    try {
+      const att = ws.deserializeAttachment() || {};
+      dev = att.device || null;
+      att.lastSeen = Date.now();
+      ws.serializeAttachment(att);
+    } catch (e) {}
     if (obj.type === "hello") {
       this.touchWs(obj.device || dev);
       if (obj.tele && typeof obj.tele === "object") {
@@ -267,6 +280,19 @@ export class Relay {
       const pair = new WebSocketPair();
       const client = pair[0];
       const server = pair[1];
+      // Single session per device+role: a fresh connection replaces older
+      // ones (freeze/thaw zombies). Client outboxes make this safe —
+      // unacked results are resent on the new connection.
+      try {
+        const dev0 = req.headers.get("X-Device") || null;
+        const role0 = req.headers.get("X-Role") === "root" ? "root" : "app";
+        for (const old of this.agentSockets()) {
+          try {
+            const a = old.deserializeAttachment() || {};
+            if ((a.device || null) === dev0 && (a.role || "app") === role0) old.close(1012, "replaced");
+          } catch (e) {}
+        }
+      } catch (e) {}
       this.ctx.acceptWebSocket(server);
       const role = req.headers.get("X-Role") === "root" ? "root" : "app";
       try {
