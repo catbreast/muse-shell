@@ -137,6 +137,7 @@ public class HttpUtil {
                 .url(wsUrl)
                 .header("X-Token", token == null ? "" : token)
                 .header("X-Device", deviceId == null ? "" : deviceId)
+                .header("X-Role", "app")
                 .build();
         OkHttpClient client = BASE.newBuilder()
                 .dns(DNS_WITH_TIMEOUT)

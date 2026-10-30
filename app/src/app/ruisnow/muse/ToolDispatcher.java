@@ -203,6 +203,9 @@ public class ToolDispatcher {
         if (tool.equals("vscreen.see")) return vscreenSee(a);
         if (tool.equals("linux.status")) return linuxStatus();
         if (tool.equals("linux.exec")) return linuxExec(a);
+        if (tool.equals("jobs.add")) return jobsAdd(a, cmdId);
+        if (tool.equals("jobs.list")) return Jobs.list(ctx);
+        if (tool.equals("jobs.remove")) return Jobs.remove(ctx, a);
         if (tool.equals("vscreen.tap")) return VScreenManager.get(ctx).tap(a);
         if (tool.equals("vscreen.swipe")) return VScreenManager.get(ctx).swipe(a);
         if (tool.equals("vscreen.key")) return VScreenManager.get(ctx).key(a);
@@ -281,6 +284,34 @@ public class ToolDispatcher {
             if (v.length() > 4500) r.put(k, v.substring(0, 4500) + "\n…[truncated]");
         }
         return r;
+    }
+
+    // ---- 本地定时任务（0.8.0）：任务在手机本地持久化、AlarmManager 准点
+    // 唤醒执行，云端只下达不管临点。审批口径：运行时不会有人在场点卡，
+    // 所以需要审批的工具在 jobs.add 这一刻一次性授权——shell 看
+    // shell_trust（与即时执行同口径），其余默认需卡的工具在此弹卡，
+    // 运行时免审。无卡工具（linux.* / ping / status 等）直接入册。
+    private static final String[] JOBS_FREE_TOOLS = {
+            "ping", "status", "linux.exec", "linux.status", "shell.check",
+            "privilege.status", "notify",
+    };
+
+    private JSONObject jobsAdd(JSONObject a, String cmdId) throws Exception {
+        String tool = a.optString("tool", "");
+        boolean free = tool.startsWith("a11y.");
+        for (String t : JOBS_FREE_TOOLS) if (t.equals(tool)) { free = true; break; }
+        if (!free) {
+            String desc = "授权本地定时任务反复执行 " + tool + "：\n" + a.toString();
+            if (desc.length() > 400) desc = desc.substring(0, 400) + "…";
+            boolean ok;
+            if (tool.equals("shell") && shellTrustSession) {
+                ok = true; // 与即时 shell 同口径：信任开则免卡
+            } else {
+                ok = ApprovalManager.request(ctx, cmdId, desc);
+            }
+            if (!ok) throw new Exception("approval_denied");
+        }
+        return Jobs.add(ctx, a, cmdId);
     }
 
     private JSONObject browserOpen(JSONObject a) throws Exception {

@@ -53,6 +53,7 @@ public class BridgeService extends Service {
     private volatile WebSocket relayWs = null;
     private volatile boolean wsOpen = false;
     private volatile long nextWsTryMs = 0;
+    private volatile long lastTelePingMs = 0;
     // 0.7.14: multi-lane dispatch. Until 0.7.13 every command ran serially
     // on the worker/WS-callback thread, so one command that never returned
     // (e.g. a pm install held by the system) starved the whole channel
@@ -78,13 +79,24 @@ public class BridgeService extends Service {
         };
     }
 
-    // Run one command on its lane and post the result when it finishes.
-    // ws != null: the command arrived on that socket (sendResultWs falls
-    // back to HTTP if the socket has since closed). ws == null: HTTP poll
-    // path, result goes back by HTTP, exactly as the serial code did.
+    // Run one command on its lane; the result goes into the Outbox and the
+    // outbox sender thread owns delivery (0.8.0: persist-first, retry until
+    // the relay acks — the old single-shot sendResultWs silently dropped
+    // results whenever the network hiccuped, which callers then read as a
+    // timeout and retried, double-executing non-idempotent commands).
+    // A command whose id already has a stored result is a redelivery:
+    // never execute twice — just re-mark the stored result for resend.
     private void submit(final ToolDispatcher dispatcher, final WebSocket ws,
                         final String base, final String token, final String dev,
                         final JSONObject cmd) {
+        final String cid = cmd.optString("id", "");
+        if (cid.length() > 0) {
+            JSONObject cached = Outbox.get(cid);
+            if (cached != null) {
+                Outbox.put(cached);
+                return;
+            }
+        }
         inFlight.incrementAndGet();
         dispatching = true;
         lastPollOkMs = System.currentTimeMillis();
@@ -95,15 +107,7 @@ public class BridgeService extends Service {
                 @Override public void run() {
                     try {
                         JSONObject result = dispatcher.dispatch(cmd);
-                        if (ws != null) {
-                            sendResultWs(ws, base, token, dev, result);
-                        } else {
-                            try {
-                                HttpUtil.request("POST", base + "/result", token, dev,
-                                        result.toString(), 10000, 15000);
-                            } catch (Exception ignored) {
-                            }
-                        }
+                        Outbox.put(result);
                     } catch (Exception ignored) {
                     } finally {
                         if (inFlight.decrementAndGet() <= 0) dispatching = false;
@@ -153,11 +157,16 @@ public class BridgeService extends Service {
         return null;
     }
 
+    public static final String ACTION_JOBS_DUE = "app.ruisnow.muse.JOBS_DUE";
+
     @Override
     public void onCreate() {
         super.onCreate();
         isRunning = true;
         Ledger.init(this);
+        Outbox.init(this);
+        Jobs.armNext(this);
+        startOutboxSender();
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Muse 壳连接", NotificationManager.IMPORTANCE_LOW));
@@ -247,6 +256,14 @@ public class BridgeService extends Service {
         if (intent != null && ACTION_START.equals(intent.getAction())) {
             Prefs.setUserStopped(this, false);
         }
+        if (intent != null && ACTION_JOBS_DUE.equals(intent.getAction())) {
+            // 本地任务到期：独立线程跑（可能含长命令），不阻塞服务启动路径
+            new Thread(new Runnable() {
+                @Override public void run() {
+                    try { Jobs.runDue(BridgeService.this); } catch (Exception ignored) {}
+                }
+            }, "muse-jobs").start();
+        }
         // Liveness is judged by the thread itself, not the running flag: if the
         // worker died (Error, freeze-kill) while the flag stayed set, a plain
         // "start service" tap must still be able to revive it.
@@ -293,6 +310,7 @@ public class BridgeService extends Service {
                     JSONObject h = new JSONObject();
                     h.put("type", "hello");
                     h.put("device", dev);
+                    h.put("tele", teleJson());
                     ws.send(h.toString());
                 } catch (Exception ignored) {
                 }
@@ -307,7 +325,19 @@ public class BridgeService extends Service {
                 } catch (Exception e) {
                     return;
                 }
-                if (obj.has("type")) return; // hello_ack / pong 等控制消息
+                if (obj.has("type")) {
+                    // 0.8.0: 中继对结果的确认——待发箱据此删条目
+                    if ("result_ack".equals(obj.optString("type", ""))) {
+                        String ackId = obj.optString("id", "");
+                        if (ackId.length() > 0) {
+                            Outbox.markAcked(ackId);
+                            lastAckMs = System.currentTimeMillis();
+                            java.util.concurrent.CountDownLatch l = ackWaiters.remove(ackId);
+                            if (l != null) l.countDown();
+                        }
+                    }
+                    return; // hello_ack / pong 等其余控制消息
+                }
                 // 0.7.14: hand each command to a lane and return at once;
                 // blocking this OkHttp callback on a dispatch was the old
                 // serial bottleneck.
@@ -337,20 +367,108 @@ public class BridgeService extends Service {
         };
     }
 
-    private void sendResultWs(WebSocket ws, String base, String token, String dev,
-                              JSONObject result) {
+    // ---- 0.8.0 结果待发箱发送线程 ----
+    static volatile long lastAckMs = 0;
+    private final java.util.Map<String, java.util.concurrent.CountDownLatch> ackWaiters =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<String, Long> nextTryMs =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<String, Integer> tryCount =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    JSONObject teleJson() {
+        JSONObject t = new JSONObject();
         try {
-            JSONObject wrap = new JSONObject();
-            wrap.put("type", "result");
-            wrap.put("result", result);
-            if (wsOpen && ws.send(wrap.toString())) return;
+            t.put("app", "0.8.0");
+            t.put("outbox_pending", Outbox.pendingCount());
+            t.put("outbox_total", Outbox.totalCount());
+            t.put("jobs_enabled", Jobs.enabledCount(this));
+            long nj = Jobs.nextDueMs(this);
+            if (nj > 0) t.put("jobs_next_ms", nj);
+            if (lastAckMs > 0) {
+                t.put("last_result_ack_ago_s",
+                        (System.currentTimeMillis() - lastAckMs) / 1000);
+            }
         } catch (Exception ignored) {
         }
-        // WS 回填失败回退 HTTP，结果不丢
-        try {
-            HttpUtil.request("POST", base + "/result", token, dev, result.toString(), 10000, 15000);
-        } catch (Exception ignored) {
+        return t;
+    }
+
+    /** 一次投递尝试：先 WS（等 result_ack ≤4s），不行再 HTTP /result（200=确认）。 */
+    private boolean deliverOnce(JSONObject envelope) {
+        String id = envelope.optString("id", "");
+        String base = Prefs.baseUrl(this);
+        String token = Prefs.token(this);
+        String dev = Prefs.deviceId(this);
+        WebSocket ws = relayWs;
+        if (wsOpen && ws != null && id.length() > 0) {
+            java.util.concurrent.CountDownLatch latch =
+                    new java.util.concurrent.CountDownLatch(1);
+            ackWaiters.put(id, latch);
+            try {
+                JSONObject wrap = new JSONObject();
+                wrap.put("type", "result");
+                wrap.put("result", envelope);
+                if (ws.send(wrap.toString())) {
+                    latch.await(4, java.util.concurrent.TimeUnit.SECONDS);
+                }
+            } catch (Exception ignored) {
+            } finally {
+                ackWaiters.remove(id);
+            }
+            if (Outbox.isAcked(id)) return true;
         }
+        try {
+            HttpUtil.Resp r = HttpUtil.request("POST", base + "/result", token, dev,
+                    envelope.toString(), 10000, 15000);
+            return r.code == 200;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void startOutboxSender() {
+        Thread t = new Thread(new Runnable() {
+            @Override public void run() {
+                while (isRunning) {
+                    try {
+                        java.util.List<String> pend = Outbox.pendingIds();
+                        if (pend.isEmpty()) {
+                            Thread.sleep(4000);
+                            continue;
+                        }
+                        long now = System.currentTimeMillis();
+                        boolean attempted = false;
+                        for (String id : pend) {
+                            if (!isRunning) return;
+                            Long nt = nextTryMs.get(id);
+                            if (nt != null && now < nt) continue;
+                            JSONObject env = Outbox.get(id);
+                            if (env == null) continue;
+                            attempted = true;
+                            if (deliverOnce(env)) {
+                                Outbox.markAcked(id);
+                                lastAckMs = System.currentTimeMillis();
+                                nextTryMs.remove(id);
+                                tryCount.remove(id);
+                            } else {
+                                int n = tryCount.containsKey(id) ? tryCount.get(id) + 1 : 1;
+                                tryCount.put(id, n);
+                                long delay = Math.min(60000L, 2000L << Math.min(n, 5));
+                                nextTryMs.put(id, System.currentTimeMillis() + delay);
+                            }
+                        }
+                        Thread.sleep(attempted ? 1200 : 3000);
+                    } catch (InterruptedException e) {
+                        return;
+                    } catch (Exception ignored) {
+                        try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
+                    }
+                }
+            }
+        }, "muse-outbox");
+        t.setDaemon(true);
+        t.start();
     }
 
     private void loop() {
@@ -371,6 +489,21 @@ public class BridgeService extends Service {
                 // 每 30 秒重试一次 WS。
                 if (wsOpen) {
                     lastPollOkMs = System.currentTimeMillis();
+                    // 0.8.0: 每 25 秒带遥测 ping 一次——/status 上的 tele
+                    // （待发箱深度、任务下次到期、最近结果确认）靠它刷新
+                    if (System.currentTimeMillis() - lastTelePingMs > 25000) {
+                        lastTelePingMs = System.currentTimeMillis();
+                        try {
+                            WebSocket ws = relayWs;
+                            if (ws != null) {
+                                JSONObject p = new JSONObject();
+                                p.put("type", "ping");
+                                p.put("tele", teleJson());
+                                ws.send(p.toString());
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }
                     Thread.sleep(1000);
                     continue;
                 }

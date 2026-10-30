@@ -120,8 +120,9 @@ phone.py call linux.exec '{"cmd":"python3 /root/muse_ocr.py /mnt/sdcard/MuseShel
   通知栏按钮随状态翻面：运行中显示「停止」，停止后的通知上是「启动」。
 - `ToolDispatcher`：全部工具的注册与分发；`Prefs.killSwitch` 是分发层总闸（默认关，现无 UI 入口）；
   `shell` 工具的免审偏好 `shell_trust` 默认开。
-- 工具清单（50 个，按域）：
+- 工具清单（53 个，按域）：
   - 基础：`ping` `status` `notify` `lock.unlock` `shell` `shell.check`
+  - 本地任务（0.8.0）：`jobs.add/list/remove`——手机本地持久化定时任务（daily/at_ms/every_min），AlarmManager 准点唤醒本机执行、结果进待发箱回仓；临点任务（如零点抢券启动）应入 jobs、不要靠云端临点下令。`shell`/`linux.*` 自 0.8.0 起由容器内 root agent（server/agent/，独立进程）直执，中继按角色路由，App 冻结不影响；其余工具仍走 App。
   - 文件：`files.list/read/write/delete/mkdir`（白名单目录）
   - 无障碍：`a11y.status/see/nodes/tree/tap/type/scroll/back/home`（手势只落**主屏**）
   - 应用：`android.launch/packages/install/uninstall/force_stop/clear/setting/input`

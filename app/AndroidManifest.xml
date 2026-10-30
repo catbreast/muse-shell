@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="app.ruisnow.muse"
-    android:versionCode="55"
-    android:versionName="0.7.15">
+    android:versionCode="56"
+    android:versionName="0.8.0">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
 
@@ -109,6 +109,10 @@
 
         <receiver
             android:name=".WatchdogReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".JobsReceiver"
             android:exported="false" />
     </application>
 </manifest>

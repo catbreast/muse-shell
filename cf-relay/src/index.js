@@ -19,6 +19,16 @@ function json(obj, code = 200) {
   });
 }
 
+// 0.8.0 角色路由：系统类工具（shell / linux.*）由手机容器内的 root agent
+// 直执（独立进程，不受 App 被 ColorOS 冻结牵连）；其余工具归 App。
+// 命令只投递给同角色的连接；无同角色连接时落持久队列，绝不串投——
+// 串投给被冻结的执行者等于丢命令（旧协议的教训）。
+const ROOT_TOOL_RE = /^(shell|linux\.)/;
+function roleFor(tool, explicit) {
+  if (explicit === "root" || explicit === "app") return explicit;
+  return ROOT_TOOL_RE.test(tool || "") ? "root" : "app";
+}
+
 export class Relay {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -83,6 +93,14 @@ export class Relay {
     try { return this.ctx.getWebSockets(); } catch (e) { return []; }
   }
 
+  socketRole(ws) {
+    try { return (ws.deserializeAttachment() || {}).role || "app"; } catch (e) { return "app"; }
+  }
+
+  socketsByRole(role) {
+    return this.agentSockets().filter((ws) => this.socketRole(ws) === role);
+  }
+
   touchWs(device) {
     if (device) this.state.device = device;
     this.state.last_seen = Date.now();
@@ -90,7 +108,8 @@ export class Relay {
   }
 
   deliverToSockets(cmd) {
-    for (const ws of this.agentSockets()) {
+    const role = cmd.role || "app";
+    for (const ws of this.socketsByRole(role)) {
       try { ws.send(JSON.stringify(cmd)); return true; } catch (e) { /* 换下一个 */ }
     }
     return false;
@@ -106,11 +125,21 @@ export class Relay {
     try { dev = (ws.deserializeAttachment() || {}).device || null; } catch (e) {}
     if (obj.type === "hello") {
       this.touchWs(obj.device || dev);
+      if (obj.tele && typeof obj.tele === "object") {
+        this.state.tele = obj.tele;
+        this.state.tele_ts = Date.now();
+        this.saveState();
+      }
       try { ws.send(JSON.stringify({ type: "hello_ack", ts: Date.now() })); } catch (e) {}
       return;
     }
     if (obj.type === "ping") {
       this.touchWs(dev);
+      if (obj.tele && typeof obj.tele === "object") {
+        this.state.tele = obj.tele;
+        this.state.tele_ts = Date.now();
+        this.saveState();
+      }
       try { ws.send(JSON.stringify({ type: "pong", ts: Date.now() })); } catch (e) {}
       return;
     }
@@ -118,11 +147,17 @@ export class Relay {
       this.touchWs(dev);
       const data = (obj.result && typeof obj.result === "object") ? obj.result : obj;
       this.deliverResult(data);
+      // 结果确认：执行者凭此删待发箱条目；没收到确认它会一直重发，
+      // deliverResult 对同 id 重复投递是幂等的（落盘覆盖 + 唤醒等待者）。
+      if (data && data.id) {
+        try { ws.send(JSON.stringify({ type: "result_ack", id: data.id })); } catch (e) {}
+      }
       return;
     }
     if (obj.id && obj.tool && (obj.ok !== undefined || obj.error !== undefined)) {
       this.touchWs(dev);
       this.deliverResult(obj);
+      try { ws.send(JSON.stringify({ type: "result_ack", id: obj.id })); } catch (e) {}
     }
   }
 
@@ -135,28 +170,42 @@ export class Relay {
   }
 
   enqueue(cmd) {
-    // WS 在线时直接推送（DO 随即继续休眠）；否则回退长轮询等待者/持久队列
+    if (!cmd.role) cmd.role = roleFor(cmd.tool);
+    // 同角色 WS 在线时直接推送（DO 随即继续休眠）；否则回退同角色长轮询等待者/持久队列
     if (this.deliverToSockets(cmd)) return;
-    // 有正在等的 /poll 就直接交付（保持 FIFO：队列非空时不会有 waiter）
-    while (this.pollWaiters.length) {
-      const resolve = this.pollWaiters.shift();
-      if (resolve(cmd)) return;
+    for (let i = 0; i < this.pollWaiters.length; i++) {
+      if (this.pollWaiters[i].role === cmd.role) {
+        const w = this.pollWaiters.splice(i, 1)[0];
+        if (w.finish(cmd)) return;
+      }
     }
     this.queue.push(cmd);
     this.saveQueue();
   }
 
-  waitPoll(ms) {
+  waitPoll(ms, role) {
     return new Promise((resolve) => {
       let done = false;
       const finish = (cmd) => { if (!done) { done = true; resolve(cmd); return true; } return false; };
       const timer = setTimeout(() => {
-        const i = this.pollWaiters.indexOf(finish);
+        const i = this.pollWaiters.findIndex((w) => w.finish === finish);
         if (i >= 0) this.pollWaiters.splice(i, 1);
         finish(null);
       }, ms);
-      this.pollWaiters.push((cmd) => { clearTimeout(timer); return finish(cmd); });
+      this.pollWaiters.push({ role: role || "app", finish: (cmd) => { clearTimeout(timer); return finish(cmd); } });
     });
+  }
+
+  // 从持久队列取同角色命令（保持相对顺序，其余原样留队）
+  takeQueued(role, n) {
+    const out = [];
+    const rest = [];
+    for (const c of this.queue) {
+      if ((c.role || "app") === role && out.length < n) out.push(c);
+      else rest.push(c);
+    }
+    if (out.length) { this.queue = rest; this.saveQueue(); }
+    return out;
   }
 
   async waitResult(id, ms) {
@@ -219,40 +268,34 @@ export class Relay {
       const client = pair[0];
       const server = pair[1];
       this.ctx.acceptWebSocket(server);
+      const role = req.headers.get("X-Role") === "root" ? "root" : "app";
       try {
-        server.serializeAttachment({ device: req.headers.get("X-Device") || null, since: Date.now() });
+        server.serializeAttachment({ device: req.headers.get("X-Device") || null, role, since: Date.now() });
       } catch (e) {}
       this.touch(req);
-      // 连接建立时把持久队列里的积压命令依次推给新 socket
+      // 连接建立时把持久队列里同角色的积压命令依次推给新 socket
+      const mine = this.takeQueued(role, 1000);
       let drained = 0;
-      while (this.queue.length) {
-        try { server.send(JSON.stringify(this.queue[0])); } catch (e) { break; }
-        this.queue.shift();
-        drained++;
+      for (const cmd of mine) {
+        try { server.send(JSON.stringify(cmd)); drained++; }
+        catch (e) { this.queue.unshift(...mine.slice(drained)); await this.saveQueue(); break; }
       }
-      if (drained) await this.saveQueue();
       return new Response(null, { status: 101, webSocket: client });
     }
 
     if (path.startsWith("/poll")) {
       this.touch(req);
       const n = Math.max(1, Math.min(parseInt(url.searchParams.get("n") || "1", 10) || 1, 16));
-      if (this.queue.length) {
-        if (n === 1) {
-          const cmd = this.queue.shift();
-          await this.saveQueue();
-          return json(cmd, 200);
-        }
-        const cmds = this.queue.splice(0, n);
-        await this.saveQueue();
-        return json({ cmds }, 200);
+      const role = url.searchParams.get("role") === "root" ? "root" : "app";
+      const queued = this.takeQueued(role, n);
+      if (queued.length) {
+        if (n === 1) return json(queued[0], 200);
+        return json({ cmds: queued }, 200);
       }
-      const cmd = await this.waitPoll(25000);
+      const cmd = await this.waitPoll(25000, role);
       if (cmd) {
         if (n === 1) return json(cmd, 200);
-        const cmds = [cmd];
-        while (cmds.length < n && this.queue.length) cmds.push(this.queue.shift());
-        if (cmds.length > 1) await this.saveQueue();
+        const cmds = [cmd, ...this.takeQueued(role, n - 1)];
         return json({ cmds }, 200);
       }
       this.touch(req);
@@ -283,7 +326,7 @@ export class Relay {
       this.state.last_tool = tool;
       this.saveState();
       const already = this.queue.some((c) => c.id === id) || this.resultWaiters.has(id);
-      if (!already) this.enqueue({ id, tool, args: data.args || {} });
+      if (!already) this.enqueue({ id, tool, args: data.args || {}, role: roleFor(tool, data.role) });
       const res = await this.waitResult(id, wait * 1000);
       if (res === null) return json({ pending: true, id }, 202);
       return json(res, 200);
@@ -317,7 +360,7 @@ export class Relay {
           ids.push(id);
           this.state.last_tool = c.tool;
           const already = this.queue.some((q) => q.id === id) || this.resultWaiters.has(id) || this.results.has(id);
-          if (!already) this.enqueue({ id, tool: c.tool, args: c.args || {} });
+          if (!already) this.enqueue({ id, tool: c.tool, args: c.args || {}, role: roleFor(c.tool, c.role) });
         }
         this.saveState();
         if (!ids.length) return json({ error: "calls_required" }, 400);
@@ -338,9 +381,17 @@ export class Relay {
         device: this.state.device,
         last_seen_ago_sec: seenTs ? (Date.now() - seenTs) / 1000 : null,
         queued: this.queue.length,
+        queued_app: this.queue.filter((c) => (c.role || "app") === "app").length,
+        queued_root: this.queue.filter((c) => c.role === "root").length,
         last_tool: this.state.last_tool,
         ws_connected: wsCount,
+        ws_app: this.socketsByRole("app").length,
+        ws_root: this.socketsByRole("root").length,
         transport: wsCount > 0 ? "websocket" : "poll",
+        // 执行者遥测（随 hello/ping 上报）：待发箱深度、最近结果确认、
+        // 下一个本地任务等——「心跳绿但命令死」的假象靠它戳穿
+        tele: this.state.tele || null,
+        tele_ago_sec: this.state.tele_ts ? (Date.now() - this.state.tele_ts) / 1000 : null,
       }, 200);
     }
 
