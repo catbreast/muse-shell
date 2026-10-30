@@ -193,6 +193,9 @@ TOOLS = {
 }
 
 
+_INFLIGHT = set()
+_INFLIGHT_LOCK = threading.Lock()
+
 def execute(cmd, send_result):
     cid = cmd.get("id")
     tool = cmd.get("tool", "")
@@ -203,6 +206,21 @@ def execute(cmd, send_result):
             log(f"dup {cid} {tool}: resend cached result")
             send_result(cached)
             return
+    # In-flight dedup: the relay redelivers when a delivery socket dies
+    # mid-execution — without this guard the redelivery runs CONCURRENTLY
+    # and side effects double (live-proven on the app side, 2026-10-31).
+    with _INFLIGHT_LOCK:
+        if cid in _INFLIGHT:
+            log(f"dup {cid} {tool}: already in flight, dropped")
+            return
+        _INFLIGHT.add(cid)
+    try:
+        _execute_inner(cid, tool, args, send_result)
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.discard(cid)
+
+def _execute_inner(cid, tool, args, send_result):
     fn = TOOLS.get(tool)
     try:
         if fn is None:

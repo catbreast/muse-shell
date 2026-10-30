@@ -64,6 +64,8 @@ public class BridgeService extends Service {
     // sequential execution. Note: commands from one batch may now finish
     // out of order; the relay matches results by call id.
     private final AtomicInteger inFlight = new AtomicInteger(0);
+    private static final java.util.Set<String> inFlightIds =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
     private final ExecutorService lanes = Executors.newFixedThreadPool(4, laneFactory("muse-lane"));
     private final ExecutorService browserLane = Executors.newSingleThreadExecutor(laneFactory("muse-browser-lane"));
 
@@ -97,6 +99,14 @@ public class BridgeService extends Service {
                 return;
             }
         }
+        if (cid.length() > 0 && !inFlightIds.add(cid)) {
+            // Redelivery while the first execution is still running (the
+            // relay requeues when a delivery socket dies mid-flight):
+            // drop the duplicate — the running execution's result reaches
+            // the caller through the Outbox. Without this guard, side
+            // effects double (live-proven 2026-10-31: file appended twice).
+            return;
+        }
         inFlight.incrementAndGet();
         dispatching = true;
         lastPollOkMs = System.currentTimeMillis();
@@ -110,11 +120,13 @@ public class BridgeService extends Service {
                         Outbox.put(result);
                     } catch (Exception ignored) {
                     } finally {
+                        if (cid.length() > 0) inFlightIds.remove(cid);
                         if (inFlight.decrementAndGet() <= 0) dispatching = false;
                     }
                 }
             });
         } catch (Exception e) {
+            if (cid.length() > 0) inFlightIds.remove(cid);
             if (inFlight.decrementAndGet() <= 0) dispatching = false;
         }
     }
