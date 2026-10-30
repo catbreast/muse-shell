@@ -39,6 +39,7 @@ export class Relay {
     this.resultWaiters = new Map();// id -> [resolve(result|null)]
     this.state = { device: null, last_seen: 0, last_tool: null };
     this.inbox = {};               // id -> {id,text,roomId,recordId,sessionId,ts,answer,answered_ts}（持久化）
+    this.inflight = {};            // cmdId -> {cmd, tag, at}（持久化）已投递未回结果的命令，socket 死亡时重投
     this.loaded = false;
   }
 
@@ -52,6 +53,8 @@ export class Relay {
       if (s && typeof s === "object") this.state = s;
       const ib = await this.ctx.storage.get("inbox");
       if (ib && typeof ib === "object") this.inbox = ib;
+      const inf = await this.ctx.storage.get("inflight");
+      if (inf && typeof inf === "object") this.inflight = inf;
     } catch (e) { /* 存储不可用时退化为纯内存 */ }
   }
 
@@ -107,6 +110,36 @@ export class Relay {
     this.saveState();
   }
 
+  async saveInflight() {
+    try { await this.ctx.storage.put("inflight", this.inflight); } catch (e) {}
+  }
+
+  socketTag(ws) {
+    try { const a = ws.deserializeAttachment() || {}; return a.since || 0; } catch (e) { return 0; }
+  }
+
+  // Requeue commands whose delivery socket is gone (freeze/thaw zombie,
+  // network flap). Executors dedup by command id (outbox / executed
+  // ledger), so redelivery never re-executes a completed command.
+  async reapInflight() {
+    const ids = Object.keys(this.inflight);
+    if (!ids.length) return;
+    const live = new Set(this.agentSockets().map((ws) => this.socketTag(ws)));
+    let changed = false;
+    for (const id of ids) {
+      const e = this.inflight[id];
+      if (!live.has(e.tag) && Date.now() - (e.at || 0) > 20000) {
+        delete this.inflight[id];
+        changed = true;
+        if (!this.deliverToSockets(e.cmd)) {
+          this.queue.unshift(e.cmd);
+          await this.saveQueue();
+        }
+      }
+    }
+    if (changed) await this.saveInflight();
+  }
+
   deliverToSockets(cmd) {
     const role = cmd.role || "app";
     // Freshest socket first: a frozen/thawed client leaves a half-dead
@@ -118,13 +151,19 @@ export class Relay {
       return { ws, seen };
     }).sort((x, y) => y.seen - x.seen);
     for (const c of cands) {
-      try { c.ws.send(JSON.stringify(cmd)); return true; } catch (e) { /* 换下一个 */ }
+      try {
+        c.ws.send(JSON.stringify(cmd));
+        this.inflight[cmd.id] = { cmd, tag: this.socketTag(c.ws), at: Date.now() };
+        this.saveInflight();
+        return true;
+      } catch (e) { /* 换下一个 */ }
     }
     return false;
   }
 
   async webSocketMessage(ws, message) {
     await this.load();
+    await this.reapInflight();
     if (typeof message !== "string") return;
     let obj;
     try { obj = JSON.parse(message); } catch (e) { return; }
@@ -175,6 +214,19 @@ export class Relay {
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
+    try {
+      const tag = this.socketTag(ws);
+      let changed = false;
+      for (const id of Object.keys(this.inflight)) {
+        const e = this.inflight[id];
+        if (e.tag === tag) {
+          delete this.inflight[id];
+          changed = true;
+          if (!this.deliverToSockets(e.cmd)) { this.queue.unshift(e.cmd); }
+        }
+      }
+      if (changed) { await this.saveQueue(); await this.saveInflight(); }
+    } catch (e) {}
     try { ws.close(code || 1000, "closed"); } catch (e) {}
   }
 
@@ -248,6 +300,7 @@ export class Relay {
   deliverResult(data) {
     const id = data && data.id;
     if (!id) return;
+    if (this.inflight[id]) { delete this.inflight[id]; this.saveInflight(); }
     // 总是落盘一份：等待者可能已随调用方断线而失效，结果被其消费后既不在
     // 内存也不在盘上就会永久丢失；落盘后 /wait 凭 id 仍可取回（waitResult
     // 查 res: 前缀），DO 休眠/回收同理。
@@ -272,6 +325,7 @@ export class Relay {
     const url = new URL(req.url);
     const path = url.pathname;
     await this.load();
+    await this.reapInflight();
 
     if (path === "/ws") {
       if ((req.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
