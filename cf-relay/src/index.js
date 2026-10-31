@@ -40,6 +40,8 @@ export class Relay {
     this.state = { device: null, last_seen: 0, last_tool: null };
     this.inbox = {};               // id -> {id,text,roomId,recordId,sessionId,ts,answer,answered_ts}（持久化）
     this.inflight = {};            // cmdId -> {cmd, tag, at}（持久化）已投递未回结果的命令，socket 死亡时重投
+    this.assemblies = new Map();   // 快车道：id -> {parts:[], next, bytes, at} 分块结果组装区（内存）
+    this.streams = new Map();      // 快车道：id -> {controller, timer, started} /callstream 在线消费者
     this.loaded = false;
   }
 
@@ -193,12 +195,19 @@ export class Relay {
     } catch (e) {}
     if (obj.type === "hello") {
       this.touchWs(obj.device || dev);
+      if (Array.isArray(obj.caps) && obj.caps.length) {
+        try {
+          const att = ws.deserializeAttachment() || {};
+          att.caps = obj.caps.filter((c) => typeof c === "string");
+          ws.serializeAttachment(att);
+        } catch (e) {}
+      }
       if (obj.tele && typeof obj.tele === "object") {
         this.state.tele = obj.tele;
         this.state.tele_ts = Date.now();
         this.saveState();
       }
-      try { ws.send(JSON.stringify({ type: "hello_ack", ts: Date.now() })); } catch (e) {}
+      try { ws.send(JSON.stringify({ type: "hello_ack", ts: Date.now(), caps: ["chunk1"] })); } catch (e) {}
       return;
     }
     if (obj.type === "ping") {
@@ -215,6 +224,19 @@ export class Relay {
       this.touchWs(dev);
       const e = this.inflight[obj.id];
       if (e && !e.acked) { e.acked = Date.now(); await this.saveInflight(); }
+      return;
+    }
+    if (obj.type === "result_chunk") {
+      this.touchWs(dev);
+      this.feedChunk(obj);
+      return;
+    }
+    if (obj.type === "result_end") {
+      this.touchWs(dev);
+      const okEnd = this.finishAssembly(obj);
+      if (okEnd && obj.id) {
+        try { ws.send(JSON.stringify({ type: "result_ack", id: obj.id })); } catch (e) {}
+      }
       return;
     }
     if (obj.type === "result") {
@@ -301,14 +323,10 @@ export class Relay {
       this.results.delete(id);
       return r;
     }
-    // 休眠唤醒后内存结果已失：查落盘副本（deliverResult 无人等待时写入）
-    try {
-      const saved = await this.ctx.storage.get("res:" + id);
-      if (saved) {
-        try { await this.ctx.storage.delete("res:" + id); } catch (e) {}
-        return saved;
-      }
-    } catch (e) {}
+    // 休眠唤醒后内存结果已失：查落盘副本（deliverResult 无人等待时写入；
+    // 大结果是切片存的，loadStoredCopy 负责拼回）
+    const savedCopy = await this.loadStoredCopy(id);
+    if (savedCopy) return savedCopy;
     return new Promise((resolve) => {
       let done = false;
       const finish = (r) => { if (!done) { done = true; resolve(r); } };
@@ -319,15 +337,152 @@ export class Relay {
     });
   }
 
-  deliverResult(data) {
+  // ---- 快车道（流式大结果）：执行者把结果 JSON 文本切片发来 ----
+  // 帧协议：{type:"result_chunk", id, seq, data} 逐片（data 为结果 JSON
+  // 文本的子串），末帧 {type:"result_end", id, bytes}（bytes = JSON 文本
+  // 的 UTF-8 字节数，完整性校验）。DO 一边组装一边转发给 /callstream 的
+  // 在线消费者（NDJSON），尾帧到达且校验通过后照常 deliverResult 落账
+  // ——慢车道语义（等待者/落盘副本）一点不变，快车道纯粹是加速通道：
+  // 流断了、DO 被回收了，调用方回退 /wait 照样能拿到落盘的大结果
+  // （大结果落盘时按 100KB 切片存，绕开单值上限）。
+  feedChunk(obj) {
+    const id = obj.id;
+    if (!id || typeof obj.data !== "string" || typeof obj.seq !== "number") return;
+    let a = this.assemblies.get(id);
+    if (obj.seq === 0 || !a) {
+      // seq 0 永远开新组：执行者重发（待发箱语义）即整组重来；在线消费者
+      // 若已收过半截，先收到 reset 把缓冲清掉，不会拼出垃圾
+      if (a && a.next > 0) {
+        const s = this.streams.get(id);
+        if (s) { s.sent = 0; this.writeStream(id, { t: "reset" }); }
+      }
+      a = { parts: [], next: 0, bytes: 0, at: Date.now() };
+      this.assemblies.set(id, a);
+    }
+    if (obj.seq !== a.next) {
+      // 乱序/缺帧：整组作废，等执行者从 seq 0 重发或走旧 result 通道
+      this.assemblies.delete(id);
+      return;
+    }
+    a.parts.push(obj.data);
+    a.next += 1;
+    a.bytes += new TextEncoder().encode(obj.data).length;
+    a.at = Date.now();
+    this.pumpStream(id);
+  }
+
+  // 把组装区里还没发给在线消费者的分片依次推入流（单一写者，无重无漏）
+  pumpStream(id) {
+    const s = this.streams.get(id);
+    const a = this.assemblies.get(id);
+    if (!s || !a) return;
+    while (s.sent < a.parts.length) {
+      const d = a.parts[s.sent];
+      try {
+        s.controller.enqueue(new TextEncoder().encode(JSON.stringify({ t: "chunk", d }) + "\n"));
+        s.sent += 1;
+      } catch (e) { this.closeStream(id); return; }
+    }
+  }
+
+  finishAssembly(obj) {
+    const id = obj.id;
+    const a = this.assemblies.get(id);
+    if (!a) return false;
+    this.assemblies.delete(id);
+    if (typeof obj.bytes === "number" && obj.bytes !== a.bytes) return false;
+    const text = a.parts.join("");
+    let data;
+    try { data = JSON.parse(text); } catch (e) { return false; }
+    this.pumpStream(id);
+    this.writeStream(id, { t: "end" });
+    this.closeStream(id);
+    this.deliverResult(data, text);
+    return true;
+  }
+
+  pruneAssemblies() {
+    const cutoff = Date.now() - 300000;
+    for (const [id, a] of this.assemblies) {
+      if (a.at < cutoff) this.assemblies.delete(id);
+    }
+  }
+
+  writeStream(id, obj) {
+    const s = this.streams.get(id);
+    if (!s) return;
+    try {
+      s.controller.enqueue(new TextEncoder().encode(JSON.stringify(obj) + "\n"));
+    } catch (e) { this.closeStream(id); }
+  }
+
+  closeStream(id) {
+    const s = this.streams.get(id);
+    if (!s) return;
+    this.streams.delete(id);
+    if (s.timer) clearInterval(s.timer);
+    try { s.controller.close(); } catch (e) {}
+  }
+
+  // 大结果落盘：单值放不下时切片存 res:<id>:n + res:<id>:<i>（原文切片）
+  async storeResultCopy(id, data, rawText) {
+    const text = typeof rawText === "string" ? rawText : JSON.stringify(data);
+    if (text.length <= 100000) {
+      try { await this.ctx.storage.put("res:" + id, data); } catch (e) {}
+      return;
+    }
+    const n = Math.ceil(text.length / 100000);
+    try {
+      await this.ctx.storage.put("res:" + id + ":n", n);
+      for (let i = 0; i < n; i++) {
+        await this.ctx.storage.put("res:" + id + ":" + i, text.slice(i * 100000, (i + 1) * 100000));
+      }
+    } catch (e) {}
+  }
+
+  async loadStoredCopy(id) {
+    try {
+      const saved = await this.ctx.storage.get("res:" + id);
+      if (saved) {
+        try { await this.ctx.storage.delete("res:" + id); } catch (e) {}
+        return saved;
+      }
+      const n = await this.ctx.storage.get("res:" + id + ":n");
+      if (typeof n === "number" && n > 0) {
+        let text = "";
+        for (let i = 0; i < n; i++) {
+          const part = await this.ctx.storage.get("res:" + id + ":" + i);
+          if (typeof part !== "string") return null;
+          text += part;
+        }
+        try {
+          await this.ctx.storage.delete("res:" + id + ":n");
+          for (let i = 0; i < n; i++) await this.ctx.storage.delete("res:" + id + ":" + i);
+        } catch (e) {}
+        return JSON.parse(text);
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  deliverResult(data, rawText) {
     const id = data && data.id;
     if (!id) return;
     if (this.inflight[id]) { delete this.inflight[id]; this.saveInflight(); }
+    // 在线流消费者：组装路径在 finishAssembly 里已推完分片并关流（此处
+    // streams 已无此 id，不会重复）；旧单帧 result 到达而流在等时，把
+    // 结果原文整块推给它并收尾——否则流消费者只能饿到超时。
+    if (this.streams.has(id)) {
+      const text = typeof rawText === "string" ? rawText : JSON.stringify(data);
+      this.writeStream(id, { t: "chunk", d: text });
+      this.writeStream(id, { t: "end" });
+      this.closeStream(id);
+    }
     // 总是落盘一份：等待者可能已随调用方断线而失效，结果被其消费后既不在
     // 内存也不在盘上就会永久丢失；落盘后 /wait 凭 id 仍可取回（waitResult
-    // 查 res: 前缀），DO 休眠/回收同理。
+    // 查 res: 前缀），DO 休眠/回收同理。大结果走切片落盘。
     try {
-      const p = this.ctx.storage.put("res:" + id, data);
+      const p = this.storeResultCopy(id, data, rawText);
       if (p && p.catch) p.catch(() => {});
     } catch (e) {}
     const list = this.resultWaiters.get(id);
@@ -348,6 +503,7 @@ export class Relay {
     const path = url.pathname;
     await this.load();
     await this.reapInflight();
+    this.pruneAssemblies();
 
     if (path === "/ws") {
       if ((req.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
@@ -372,7 +528,8 @@ export class Relay {
       this.ctx.acceptWebSocket(server);
       const role = req.headers.get("X-Role") === "root" ? "root" : "app";
       try {
-        server.serializeAttachment({ device: req.headers.get("X-Device") || null, role, since: Date.now() });
+        const caps = (req.headers.get("X-Caps") || "").split(",").map((s) => s.trim()).filter(Boolean);
+        server.serializeAttachment({ device: req.headers.get("X-Device") || null, role, since: Date.now(), caps });
       } catch (e) {}
       this.touch(req);
       // 连接建立时把持久队列里同角色的积压命令依次推给新 socket
@@ -383,6 +540,68 @@ export class Relay {
         catch (e) { this.queue.unshift(...mine.slice(drained)); await this.saveQueue(); break; }
       }
       return new Response(null, { status: 101, webSocket: client });
+    }
+
+    if (path.startsWith("/callstream")) {
+      // 快车道：与 /call 同语义入队，但结果以 NDJSON 流回：{"t":"begin"}、
+      // 若干 {"t":"chunk","d":...}（拼起来即结果 JSON 原文）、{"t":"end"}；
+      // 等待期间每 20s 一帧 {"t":"ping"} 保活。目标执行者不支持分块、
+      // 或结果已在内存/队列中时，退化为与 /call 完全一致的 JSON 应答，
+      // 旧客户端与慢车道语义不受影响。流断开不影响投递：结果照常落账，
+      // 调用方用同一 id 走 /wait 即可取回（含大切片落盘的副本）。
+      const data = await req.json().catch(() => ({}));
+      const tool = data.tool;
+      if (!tool) return json({ error: "tool_required" }, 400);
+      const id = (typeof data.id === "string" && /^[a-zA-Z0-9-]{6,32}$/.test(data.id))
+        ? data.id
+        : crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+      if (this.results.has(id)) {
+        const r = this.results.get(id);
+        this.results.delete(id);
+        return json(r, 200);
+      }
+      const role = roleFor(tool, data.role);
+      const roleCaps = this.socketsByRole(role).map((ws) => {
+        try { return (ws.deserializeAttachment() || {}).caps || []; } catch (e) { return []; }
+      });
+      const canChunk = roleCaps.some((c) => c.includes("chunk1"));
+      this.state.last_tool = tool;
+      this.saveState();
+      const already = this.queue.some((c) => c.id === id) || this.resultWaiters.has(id) || this.inflight[id];
+      if (!canChunk) {
+        if (!already) this.enqueue({ id, tool, args: data.args || {}, role });
+        const wait = Math.max(1, Math.min(Number(data.wait || 50), 55));
+        const res = await this.waitResult(id, wait * 1000);
+        if (res === null) return json({ pending: true, id }, 202);
+        return json(res, 200);
+      }
+      if (this.streams.has(id) || this.streams.size >= 8) {
+        return json({ error: "stream_busy", id }, 429);
+      }
+      const enc = new TextEncoder();
+      let controllerRef = null;
+      const stream = new ReadableStream({
+        start: (controller) => { controllerRef = controller; },
+        cancel: () => { this.closeStream(id); },
+      });
+      const sink = { controller: controllerRef, timer: null, started: Date.now(), sent: 0 };
+      this.streams.set(id, sink);
+      try { sink.controller.enqueue(enc.encode(JSON.stringify({ t: "begin", id }) + "\n")); } catch (e) {}
+      sink.timer = setInterval(() => {
+        if (Date.now() - sink.started > 900000) {
+          this.writeStream(id, { t: "error", error: "stream_timeout" });
+          this.closeStream(id);
+          return;
+        }
+        this.writeStream(id, { t: "ping" });
+      }, 20000);
+      if (!already) this.enqueue({ id, tool, args: data.args || {}, role, stream: true });
+      // 组装区可能已有先到的分片（命令早先已入队）：从游标处补推
+      this.pumpStream(id);
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson", "Cache-Control": "no-store" },
+      });
     }
 
     if (path.startsWith("/poll")) {
@@ -489,6 +708,11 @@ export class Relay {
         ws_connected: wsCount,
         ws_app: this.socketsByRole("app").length,
         ws_root: this.socketsByRole("root").length,
+        fastlane: {
+          app: this.socketsByRole("app").some((ws) => { try { return ((ws.deserializeAttachment() || {}).caps || []).includes("chunk1"); } catch (e) { return false; } }),
+          root: this.socketsByRole("root").some((ws) => { try { return ((ws.deserializeAttachment() || {}).caps || []).includes("chunk1"); } catch (e) { return false; } }),
+          streams: this.streams.size,
+        },
         transport: wsCount > 0 ? "websocket" : "poll",
         // 执行者遥测（随 hello/ping 上报）：待发箱深度、最近结果确认、
         // 下一个本地任务等——「心跳绿但命令死」的假象靠它戳穿

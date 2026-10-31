@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Muse 壳 root agent（0.8.0）：跑在手机 Debian 容器内的独立执行面。
+"""Muse 壳 root agent（0.8.0；快车道版 v5）：跑在手机 Debian 容器内的独立执行面。
 
 与 App（BridgeService）分工：本 agent 只执行系统类工具
 （shell / shell.check / privilege.status / linux.exec / linux.status），
@@ -137,18 +137,31 @@ def run_host_sh(cmd, timeout):
     return p.returncode, p.stdout, p.stderr
 
 
-def tool_shell(args):
+def _out_limit(args, big, default):
+    """输出截断上限：调用方可用 max_output 显式指定（≤1MB）；流式调用
+    （快车道）默认放开到 1MB；旧调用维持原小上限，保护老消费者。"""
+    try:
+        mo = int(args.get("max_output") or 0)
+    except Exception:
+        mo = 0
+    if mo > 0:
+        return max(200, min(mo, 1000000))
+    return 1000000 if big else default
+
+
+def tool_shell(args, big=False):
     cmd = args.get("cmd", "")
     timeout = max(1, min(int(args.get("timeout", 120)), 600))
     try:
         rc, out, err = run_host_sh(cmd, timeout)
     except subprocess.TimeoutExpired:
         raise Exception(f"shell_timeout_{timeout}s")
-    return {"exit": rc, "stdout": cap(out, 6000), "stderr": cap(err, 6000),
+    lim = _out_limit(args, big, 6000)
+    return {"exit": rc, "stdout": cap(out, lim), "stderr": cap(err, lim),
             "via": "root-agent"}
 
 
-def tool_shell_check(args):
+def tool_shell_check(args, big=False):
     try:
         rc, out, err = run_host_sh("id", 10)
         root = rc == 0 and "uid=0" in out
@@ -159,7 +172,7 @@ def tool_shell_check(args):
             "via": "root-agent", "detail": out.strip()[:200]}
 
 
-def tool_linux_exec(args):
+def tool_linux_exec(args, big=False):
     cmd = args.get("cmd", "")
     timeout = max(1, min(int(args.get("timeout", 60)), 600))
     try:
@@ -167,11 +180,12 @@ def tool_linux_exec(args):
                            text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise Exception(f"shell_timeout_{timeout}s")
-    return {"exit": p.returncode, "stdout": cap(p.stdout, 4500),
-            "stderr": cap(p.stderr, 4500), "via": "root-agent"}
+    lim = _out_limit(args, big, 4500)
+    return {"exit": p.returncode, "stdout": cap(p.stdout, lim),
+            "stderr": cap(p.stderr, lim), "via": "root-agent"}
 
 
-def tool_linux_status(args):
+def tool_linux_status(args, big=False):
     pretty = ""
     try:
         with open("/etc/os-release") as f:
@@ -215,17 +229,17 @@ def execute(cmd, send_result):
             return
         _INFLIGHT.add(cid)
     try:
-        _execute_inner(cid, tool, args, send_result)
+        _execute_inner(cid, tool, args, send_result, big=bool(cmd.get("stream")))
     finally:
         with _INFLIGHT_LOCK:
             _INFLIGHT.discard(cid)
 
-def _execute_inner(cid, tool, args, send_result):
+def _execute_inner(cid, tool, args, send_result, big=False):
     fn = TOOLS.get(tool)
     try:
         if fn is None:
             raise Exception("tool_not_for_root_agent: " + tool)
-        result = {"id": cid, "ok": True, "result": fn(args)}
+        result = {"id": cid, "ok": True, "result": fn(args, big)}
     except Exception as e:
         result = {"id": cid, "ok": False, "error": str(e)[:500]}
     outbox_put(result)
@@ -245,15 +259,32 @@ def main():
     pool = ThreadPoolExecutor(max_workers=4)
     ws_ref = {"ws": None}
     send_lock = threading.Lock()
+    relay_caps = {"chunk1": False}
 
     def send_result(result):
-        payload = json.dumps({"type": "result", "result": result})
+        # 快车道：中继在 hello_ack 里宣告 chunk1 且结果较大时，把结果
+        # JSON 文本切片逐帧发（中继组装 + 转发在线消费者 + 尾帧落账）；
+        # 否则维持旧的单帧 result。待发箱/ack 语义不变：result_end 后
+        # 中继回 result_ack，未确认则整组由 outbox 机制重发。
+        text = json.dumps(result)
+        chunked = relay_caps["chunk1"] and len(text) > 16384
         with send_lock:
             ws = ws_ref["ws"]
             if ws is None:
                 return
             try:
-                ws.send(payload)
+                if not chunked:
+                    ws.send(json.dumps({"type": "result", "result": result}))
+                    return
+                total = len(text.encode("utf-8"))
+                seq = 0
+                for i in range(0, len(text), 16384):
+                    ws.send(json.dumps({"type": "result_chunk",
+                                        "id": result["id"], "seq": seq,
+                                        "data": text[i:i + 16384]}))
+                    seq += 1
+                ws.send(json.dumps({"type": "result_end",
+                                    "id": result["id"], "bytes": total}))
             except Exception:
                 pass
 
@@ -271,11 +302,13 @@ def main():
                 url, timeout=30,
                 header=[f"X-Token: {CFG['token']}",
                         f"X-Device: {CFG['device']}",
-                        "X-Role: root"])
+                        "X-Role: root",
+                        "X-Caps: chunk1"])
             ws_ref["ws"] = ws
             backoff = 2
             ws.send(json.dumps({"type": "hello", "device": CFG["device"],
-                                "role": "root", "tele": tele()}))
+                                "role": "root", "caps": ["chunk1"],
+                                "tele": tele()}))
             log("connected, flushing outbox")
             flush_outbox()
             last_ping = time.time()
@@ -292,6 +325,8 @@ def main():
                         continue
                     if obj.get("type") == "result_ack":
                         outbox_ack(obj.get("id", ""))
+                    elif obj.get("type") == "hello_ack":
+                        relay_caps["chunk1"] = "chunk1" in (obj.get("caps") or [])
                     elif obj.get("id") and obj.get("tool"):
                         # Receipt ack FIRST: the relay requeues unacked
                         # commands — without it a frame lost in a flap (or

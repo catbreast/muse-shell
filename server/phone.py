@@ -71,6 +71,65 @@ def batch_call(calls, timeout=120):
     return [got.get(i, {"ok": False, "error": "phone_timeout_or_offline"}) for i in ids]
 
 
+class StreamFail(Exception):
+    pass
+
+
+def call_stream(cid, tool, args, deadline):
+    """快车道：POST /callstream，结果以 NDJSON 流回（chunk 帧拼起来即
+    结果 JSON 原文）。中继不支持/执行者不会分块时，中继直接按 /call
+    语义返回普通 JSON——按 Content-Type 分辨。流中断抛 StreamFail，
+    调用方用同一 id 回退慢车道 /wait 取落盘副本（中继尾帧落账保证）。"""
+    r = urllib.request.Request(BASE + "/callstream", method="POST")
+    r.add_header("X-Token", ADMIN)
+    r.add_header("User-Agent", UA)
+    data = json.dumps({"id": cid, "tool": tool, "args": args}).encode()
+    r.add_header("Content-Type", "application/json")
+    try:
+        resp = urllib.request.urlopen(r, data=data, timeout=70)
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            raise StreamFail(f"http_{e.code}")
+    with resp:
+        ctype = resp.headers.get("Content-Type", "")
+        if "ndjson" not in ctype:
+            raw = resp.read().decode()
+            try:
+                return resp.status, (json.loads(raw) if raw else {})
+            except Exception:
+                raise StreamFail("bad_json_response")
+        parts = []
+        while True:
+            if time.time() > deadline:
+                raise StreamFail("deadline")
+            line = resp.readline()
+            if not line:
+                raise StreamFail("eof_without_end")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                frame = json.loads(line)
+            except Exception:
+                raise StreamFail("bad_frame")
+            t = frame.get("t")
+            if t == "chunk":
+                parts.append(frame.get("d", ""))
+            elif t == "reset":
+                parts = []
+            elif t == "end":
+                try:
+                    return 200, json.loads("".join(parts))
+                except Exception:
+                    raise StreamFail("assembly_parse_fail")
+            elif t == "error":
+                raise StreamFail(frame.get("error", "stream_error"))
+            # begin / ping 帧：忽略
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -88,9 +147,25 @@ def main():
         deadline = time.time() + timeout
         cid = uuid.uuid4().hex[:12]
         try:
-            code, res = req("POST", "/call",
-                            {"id": cid, "tool": tool, "args": args, "wait": 50},
-                            timeout=65)
+            code, res = None, None
+            if not os.environ.get("PHONE_NOSTREAM"):
+                try:
+                    code, res = call_stream(cid, tool, args, deadline)
+                except Exception as e:
+                    if os.environ.get("PHONE_DEBUG"):
+                        print(f"[stream-fail: {e}]", file=sys.stderr)
+                    # 流可能是在命令已带 stream 入队后才断的：先纯取回
+                    # /wait（不重新入队），取不到才走 /call 慢车道。
+                    try:
+                        wcode, wres = req("POST", "/wait", {"id": cid, "wait": 5}, timeout=15)
+                        if wcode == 200:
+                            code, res = wcode, wres
+                    except Exception:
+                        pass
+            if code is None:
+                code, res = req("POST", "/call",
+                                {"id": cid, "tool": tool, "args": args, "wait": 50},
+                                timeout=65)
             while code == 202 and res.get("pending") and time.time() < deadline:
                 code, res = req("POST", "/wait", {"id": res["id"], "wait": 50}, timeout=65)
             if code == 202:

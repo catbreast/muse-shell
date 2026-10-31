@@ -322,6 +322,7 @@ public class BridgeService extends Service {
                     JSONObject h = new JSONObject();
                     h.put("type", "hello");
                     h.put("device", dev);
+                    h.put("caps", new JSONArray().put("chunk1"));
                     h.put("tele", teleJson());
                     ws.send(h.toString());
                 } catch (Exception ignored) {
@@ -338,6 +339,15 @@ public class BridgeService extends Service {
                     return;
                 }
                 if (obj.has("type")) {
+                    // 快车道：中继在 hello_ack 宣告它能收分块结果
+                    if ("hello_ack".equals(obj.optString("type", ""))) {
+                        JSONArray caps = obj.optJSONArray("caps");
+                        if (caps != null) {
+                            for (int i = 0; i < caps.length(); i++) {
+                                if ("chunk1".equals(caps.optString(i, ""))) relayChunk1 = true;
+                            }
+                        }
+                    }
                     // 0.8.0: 中继对结果的确认——待发箱据此删条目
                     if ("result_ack".equals(obj.optString("type", ""))) {
                         String ackId = obj.optString("id", "");
@@ -381,6 +391,7 @@ public class BridgeService extends Service {
 
     // ---- 0.8.0 结果待发箱发送线程 ----
     static volatile long lastAckMs = 0;
+    static volatile boolean relayChunk1 = false;
     private final java.util.Map<String, java.util.concurrent.CountDownLatch> ackWaiters =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Map<String, Long> nextTryMs =
@@ -391,7 +402,7 @@ public class BridgeService extends Service {
     JSONObject teleJson() {
         JSONObject t = new JSONObject();
         try {
-            t.put("app", "0.8.0");
+            t.put("app", "0.8.2");
             t.put("outbox_pending", Outbox.pendingCount());
             t.put("outbox_total", Outbox.totalCount());
             t.put("jobs_enabled", Jobs.enabledCount(this));
@@ -418,11 +429,38 @@ public class BridgeService extends Service {
                     new java.util.concurrent.CountDownLatch(1);
             ackWaiters.put(id, latch);
             try {
-                JSONObject wrap = new JSONObject();
-                wrap.put("type", "result");
-                wrap.put("result", envelope);
-                if (ws.send(wrap.toString())) {
-                    latch.await(4, java.util.concurrent.TimeUnit.SECONDS);
+                String text = envelope.toString();
+                if (relayChunk1 && text.length() > 16384) {
+                    // 快车道：结果 JSON 文本切片逐帧发，中继组装后回
+                    // result_ack（与单帧同一确认语义）；任一帧发不出就
+                    // 放弃本次 WS 尝试，走下面的 HTTP 回退。
+                    boolean sent = true;
+                    int seq = 0;
+                    for (int i = 0; i < text.length() && sent; i += 16384) {
+                        JSONObject f = new JSONObject();
+                        f.put("type", "result_chunk");
+                        f.put("id", id);
+                        f.put("seq", seq++);
+                        f.put("data", text.substring(i, Math.min(text.length(), i + 16384)));
+                        sent = ws.send(f.toString());
+                    }
+                    if (sent) {
+                        JSONObject end = new JSONObject();
+                        end.put("type", "result_end");
+                        end.put("id", id);
+                        end.put("bytes", text.getBytes("UTF-8").length);
+                        sent = ws.send(end.toString());
+                    }
+                    if (sent) {
+                        latch.await(20, java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                } else {
+                    JSONObject wrap = new JSONObject();
+                    wrap.put("type", "result");
+                    wrap.put("result", envelope);
+                    if (ws.send(wrap.toString())) {
+                        latch.await(4, java.util.concurrent.TimeUnit.SECONDS);
+                    }
                 }
             } catch (Exception ignored) {
             } finally {
