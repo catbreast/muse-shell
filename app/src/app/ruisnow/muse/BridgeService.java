@@ -402,7 +402,7 @@ public class BridgeService extends Service {
     JSONObject teleJson() {
         JSONObject t = new JSONObject();
         try {
-            t.put("app", "0.8.2");
+            t.put("app", "0.8.3");
             t.put("outbox_pending", Outbox.pendingCount());
             t.put("outbox_total", Outbox.totalCount());
             t.put("jobs_enabled", Jobs.enabledCount(this));

@@ -29,10 +29,60 @@ public class ShellA11yService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
+        logToastLine("sys", "a11y_connected", "");
+        try {
+            android.widget.Toast.makeText(this, "Muse 壳 toast 记录已开启",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {
+        }
     }
 
+    // ---- 0.8.3: toast 落盘 ----
+    // 系统不存 toast 历史（消失即销毁），只能靠无障碍事件实时录：
+    // TYPE_NOTIFICATION_STATE_CHANGED 里 parcelableData 为空的是 toast
+    //（通知带 Notification 对象）。逐行 JSON 追加到
+    // /sdcard/MuseShell/toasts.jsonl，供抢券等流程事后判读小字提示
+    //（如拼多多加队成败只闪 toast、截图抓不到）。文件超 1MB 整体轮换。
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+        if (event.getEventType() != AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) return;
+        boolean isToast = event.getParcelableData() == null
+                || "android.widget.Toast".equals(String.valueOf(event.getClassName()));
+        if (!isToast) return;
+        StringBuilder text = new StringBuilder();
+        for (CharSequence cs : event.getText()) {
+            if (cs == null) continue;
+            if (text.length() > 0) text.append(' ');
+            text.append(cs);
+        }
+        if (text.length() == 0) return;
+        logToastLine(String.valueOf(event.getPackageName()), text.toString(),
+                String.valueOf(event.getClassName()));
+    }
+
+    private static final Object TOAST_LOG_LOCK = new Object();
+
+    private void logToastLine(String pkg, String text, String cls) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("ts", System.currentTimeMillis());
+            o.put("pkg", pkg);
+            o.put("text", text);
+            if (cls != null && cls.length() > 0) o.put("cls", cls);
+            synchronized (TOAST_LOG_LOCK) {
+                java.io.File dir = new java.io.File(
+                        android.os.Environment.getExternalStorageDirectory(), "MuseShell");
+                if (!dir.exists()) dir.mkdirs();
+                java.io.File f = new java.io.File(dir, "toasts.jsonl");
+                if (f.exists() && f.length() > 1000000) f.delete();
+                java.io.FileWriter w = new java.io.FileWriter(f, true);
+                w.write(o.toString());
+                w.write("\n");
+                w.close();
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
