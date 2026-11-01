@@ -7,21 +7,122 @@
 例：phone.py call files.list '{"path":"/sdcard/MuseShell"}'
     phone.py batch '[{"tool":"ping","args":{}},{"tool":"ping","args":{}}]'
 """
+import http.client
 import json
 import os
+import socket
+import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(HERE, "tokens.json")) as f:
     ADMIN = json.load(f)["admin"]
+# 2026-11-02 设备定向：默认钉一加 13（ec751bad）；GT7 用 PHONE_DEVICE=2182b319。
+# 中继按 device 只投目标设备的连接；设 PHONE_DEVICE=none 则不带目标（旧行为）。
+DEVICE = os.environ.get("PHONE_DEVICE", "ec751bad")
+if DEVICE.lower() in ("", "none"):
+    DEVICE = None
 # 2026-10-22 迁移：中继已搬到 Cloudflare 边缘（Worker + Durable Object），
 # 经 https://phone.ruisnow.de 走。BASE 可用环境变量 PHONE_BASE 覆盖。
 BASE = os.environ.get("PHONE_BASE", "https://phone.ruisnow.de")
 UA = "muse-phone.py/2.0"
+
+# 2026-11-02 BWG 优选（用户拍板）：沙盒直连 CF 落点迈阿密（/status 约 1.2s），
+# 改走常驻 SSH 隧道 沙盒→BWG（127.0.0.1:11080 SOCKS5）→CF 落 LAX（约 0.3s）。
+# 每次进程启动探活一次：隧道不在位、或中途传输失败 → 自动回落直连（旧行为）。
+# PHONE_NO_BWG=1 可禁用。隧道保活：~/workspace/relay-bwg-tunnel/tunnel.sh。
+_BWG_SOCKS = ("127.0.0.1", 11080)
+_bwg_mode = {"via": None}  # None=未探活 / "bwg"=走隧道 / "direct"=直连
+
+
+def _recvn(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise OSError("socks5: unexpected eof")
+        buf += chunk
+    return buf
+
+
+def _socks5_connect(host, port, timeout):
+    s = socket.create_connection(_BWG_SOCKS, timeout=timeout)
+    try:
+        s.sendall(b"\x05\x01\x00")
+        if _recvn(s, 2) != b"\x05\x00":
+            raise OSError("socks5 greeting rejected")
+        hb = host.encode()
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + port.to_bytes(2, "big"))
+        hdr = _recvn(s, 4)
+        if hdr[1] != 0:
+            raise OSError(f"socks5 connect rep={hdr[1]}")
+        atyp = hdr[3]
+        if atyp == 1:
+            _recvn(s, 4)
+        elif atyp == 3:
+            _recvn(s, _recvn(s, 1)[0])
+        elif atyp == 4:
+            _recvn(s, 16)
+        _recvn(s, 2)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+class _BwgHTTPS(http.client.HTTPSConnection):
+    def connect(self):
+        raw = _socks5_connect(self.host, self.port, self.timeout or 60)
+        ctx = self._context or ssl.create_default_context()
+        self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+
+
+class _BwgHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(_BwgHTTPS, request)
+
+
+def _build_opener():
+    if os.environ.get("PHONE_NO_BWG"):
+        _bwg_mode["via"] = "direct"
+        return urllib.request.build_opener()
+    # 全程探活：不只探 SOCKS 端口，要真经隧道连一次目标（隧道在位但 BWG 侧
+    # 解析/连出失败时，端口探活是假绿——2026-11-02 实测踩过）。
+    try:
+        u = urllib.parse.urlsplit(BASE)
+        s = _socks5_connect(u.hostname, u.port or 443, 3)
+        s.close()
+        _bwg_mode["via"] = "bwg"
+        # 必须禁掉 ProxyHandler：沙盒环境带 https_proxy（平台出口代理），默认
+        # opener 会先把请求改写给它，SOCKS 目标就会变成代理主机名（BWG 侧
+        # 解析失败）或在 TLS 里塞 CONNECT（流式请求挂死）——2026-11-02 实测。
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), _BwgHandler())
+    except Exception:
+        _bwg_mode["via"] = "direct"
+        return urllib.request.build_opener()
+
+
+_OPENER = None
+
+
+def _open(r, data=None, timeout=60):
+    """隧道优先、失败回落直连的 urlopen 替代（req/call_stream 共用）。"""
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = _build_opener()
+    try:
+        return _OPENER.open(r, data=data, timeout=timeout)
+    except Exception:
+        if _bwg_mode["via"] == "bwg":
+            # 隧道中途失效：切直连再抛回，调用方既有重试会走直连。
+            _OPENER = urllib.request.build_opener()
+            _bwg_mode["via"] = "direct"
+        raise
 
 
 def req(method, path, body=None, timeout=60, retries=2):
@@ -36,7 +137,7 @@ def req(method, path, body=None, timeout=60, retries=2):
             data = json.dumps(body).encode()
             r.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(r, data=data, timeout=timeout) as resp:
+            with _open(r, data=data, timeout=timeout) as resp:
                 raw = resp.read().decode()
                 return resp.status, (json.loads(raw) if raw else {})
         except urllib.error.HTTPError as e:
@@ -60,7 +161,7 @@ def batch_call(calls, timeout=120):
     ids = [c["id"] for c in items]
     got = {}
     deadline = time.time() + timeout
-    code, res = req("POST", "/batch", {"calls": items, "wait": 50}, timeout=65)
+    code, res = req("POST", "/batch", {"calls": items, "wait": 50, "device": DEVICE}, timeout=65)
     while True:
         for k, v in (res.get("results") or {}).items():
             got[k] = v
@@ -83,10 +184,10 @@ def call_stream(cid, tool, args, deadline):
     r = urllib.request.Request(BASE + "/callstream", method="POST")
     r.add_header("X-Token", ADMIN)
     r.add_header("User-Agent", UA)
-    data = json.dumps({"id": cid, "tool": tool, "args": args}).encode()
+    data = json.dumps({"id": cid, "tool": tool, "args": args, "device": DEVICE}).encode()
     r.add_header("Content-Type", "application/json")
     try:
-        resp = urllib.request.urlopen(r, data=data, timeout=70)
+        resp = _open(r, data=data, timeout=70)
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
         try:
@@ -164,7 +265,7 @@ def main():
                         pass
             if code is None:
                 code, res = req("POST", "/call",
-                                {"id": cid, "tool": tool, "args": args, "wait": 50},
+                                {"id": cid, "tool": tool, "args": args, "wait": 50, "device": DEVICE},
                                 timeout=65)
             while code == 202 and res.get("pending") and time.time() < deadline:
                 code, res = req("POST", "/wait", {"id": res["id"], "wait": 50}, timeout=65)
