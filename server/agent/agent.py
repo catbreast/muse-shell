@@ -229,6 +229,14 @@ def execute(cmd, send_result):
             log(f"dup {cid} {tool}: resend cached result")
             send_result(cached)
             return
+        # Executed once but no result in outbox (e.g. reboot killed the
+        # machine mid-execution before a result existed). Refuse to
+        # re-execute: a resultless command may have had irreversible
+        # side effects (live double-reboot, 2026-11-02).
+        log(f"dup {cid} {tool}: already executed, no cached result; suppressed")
+        send_result({"id": cid, "ok": False,
+                     "error": "duplicate_suppressed_no_result: command already started once and produced no result; refusing to re-execute"})
+        return
     # In-flight dedup: the relay redelivers when a delivery socket dies
     # mid-execution — without this guard the redelivery runs CONCURRENTLY
     # and side effects double (live-proven on the app side, 2026-10-31).
@@ -237,6 +245,10 @@ def execute(cmd, send_result):
             log(f"dup {cid} {tool}: already in flight, dropped")
             return
         _INFLIGHT.add(cid)
+    # Write-ahead: record the command as executed BEFORE running it, so a
+    # command that kills the machine mid-execution (reboot) is already in
+    # the ledger when the relay redelivers it after the reboot.
+    mark_executed(cid)
     try:
         _execute_inner(cid, tool, args, send_result, big=bool(cmd.get("stream")))
     finally:
