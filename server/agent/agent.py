@@ -30,15 +30,24 @@ MAX_EXECUTED = 300
 os.makedirs(OUTBOX, exist_ok=True)
 
 
-# Force IPv4: this phone's IPv6 route to Cloudflare blackholes the same
-# way the PC's did (TCP/TLS stalls while IPv4 is fine). The PC agent got
-# the same cure (forced tcp4); without it the agent's TLS handshakes to
-# the relay time out in bursts while the Android app connects fine.
+# Address-family preference: IPv6 first, IPv4 kept as fallback.
+# History: this phone's IPv6 route to Cloudflare used to blackhole (TCP/TLS
+# stalls while IPv4 was fine), so the agent forced IPv4-only. On 2026-11-01
+# the situation inverted — IPv4 egress got RST on connect while IPv6 was
+# healthy — and the forced-v4 patch pinned the agent to the dead family for
+# hours. Ordered preference lets whichever route is alive tonight win;
+# websocket-client walks the list until a connect succeeds.
 import socket as _sock
 _orig_gai = _sock.getaddrinfo
-def _gai4(host, port, family=0, *a, **kw):
-    return _orig_gai(host, port, _sock.AF_INET, *a, **kw)
-_sock.getaddrinfo = _gai4
+def _gai46(host, port, family=0, *a, **kw):
+    res = _orig_gai(host, port, 0, *a, **kw)
+    v6 = [r for r in res if r[0] == _sock.AF_INET6]
+    v4 = [r for r in res if r[0] == _sock.AF_INET]
+    if v6 and v4:
+        rest = [r for r in res if r[0] not in (_sock.AF_INET, _sock.AF_INET6)]
+        return v6 + v4 + rest
+    return res
+_sock.getaddrinfo = _gai46
 
 def log(msg):
     line = time.strftime("%F %T") + " " + str(msg)
