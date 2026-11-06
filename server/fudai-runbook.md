@@ -5,7 +5,7 @@
 
 ## 环境与铁律
 
-- 工具都在 `~/workspace/muse-android-shell/server/`：`phone.py call <tool> '<json>'`。
+- 工具（2026-11-07 起 OP13 走新栈）：`python3 ~/workspace/muse-shell-ng/op13.py <tool> '<json>'`（沙盒→tailnet→commd→museng）。开工先 `op13.py shell` 跑 `input keyevent KEYCODE_WAKEUP; am start -n app.ruisnow.museng/.MainActivity` 唤醒并前台 museng（普通应用闲置会被 ColorOS 冻结，app 类工具转发会超时；长跑期间靠护屏 keeper 保持屏幕常亮）。
 - **看图首选手机本机 OCR（图不出手机、整帧约 2 秒、坐标即真实屏像素、无需换算）**：
   `shell` 工具跑 `SFID=$(dumpsys SurfaceFlinger --display-id | grep MuseScreen | grep -oE 'Display [0-9]+' | grep -oE '[0-9]+')`
   取当前虚拟屏的 SurfaceFlinger ID（每次建屏都会变，必须现查），
@@ -16,17 +16,17 @@
   `./ocr-venv/bin/python ocrtap.py file <图>`（屏坐标 = 图坐标 / scale）。
 - 全程只在**虚拟屏**（1080×2376@480，逻辑宽 360dp）里操作，**绝不碰主屏**：a11y.* 的手势只落主屏，禁用；
   只用 vscreen.* 与 shell 工具。
-- **toast 落盘（0.8.3 起）**：开跑前先经 shell 工具跑一遍 `/data/local/muse-a11y-ensure.sh`
-  确保壳无障碍服务在绑（手势仍禁用，开服务只是为了录 toast）。系统不存 toast 历史，
-  壳把 TYPE_NOTIFICATION_STATE_CHANGED 的 toast 实时追加到 `/sdcard/MuseShell/toasts.jsonl`
-  （容器里读 `/mnt/sdcard/MuseShell/toasts.jsonl`）。加队成败的 toast 在这里判读，
+- **toast 落盘**：museng 的无障碍服务在置换时已用 root 写入 secure 设置启用（手势仍禁用，
+  开服务只是为了录 toast）；开跑前用 `op13.py a11y.status '{}'` 确认 enabled。系统不存 toast 历史，
+  museng 把 TYPE_NOTIFICATION_STATE_CHANGED 的 toast 实时追加到 App 私有目录
+  `/data/data/app.ruisnow.museng/files/toasts.jsonl`（经 shell 工具读）。加队成败的 toast 在这里判读，
   不再只靠袋位翻没翻猜（袋位仍是主判据，toast 为辅证，积累实测文案后再升格）。
 - 不下单、不付款、不点商品购买按钮。抽券之外不点任何商品卡（奖励商品页只用左上角箭头返回）。
 
 ## 流程
 
-1. `phone.py call status '{}'` 确认壳在线（version ≥0.6.6）；失败等 60 秒重试一次，再失败报错退出。
-2. 解锁：`phone.py call lock.unlock '{}'`（零参数，PIN 在手机端；未锁自动跳过）。
+1. `op13.py status '{}'` 确认新栈在线（app=museng、bridge=connected）；失败等 60 秒重试一次，再失败报错退出。
+2. 解锁：`op13.py lock.unlock '{}'`（零参数，PIN 存在 museng 里；若返回 false，先经 shell 上滑露出 PIN 面板再重试一次）。
 3. `vscreen.create {"width":1080,"height":2376,"dpi":480}`（已存在会报错，忽略），
    `vscreen.launch {"package":"com.xunmeng.pinduoduo"}`，等 6 秒。
 4. 进消费券页：取帧 OCR 找「百亿」点入专区（中途弹免费礼物窗就点右上 × 关掉，
@@ -35,13 +35,14 @@
 5. 看三袋状态（袋行按钮文案）：
    - 「去使用」= 已抽到，跳过。
    - 「立即抽福袋」= 直接点 → 结果弹窗点「开心收下」（约在屏 (540,1737) 附近，每帧 OCR 定）。
+   - **新版「3 选 1」形态（2026-11-06 GT7 新栈场实测，与旧弹窗形态并存）**：点袋后不是直接出结果弹窗，而是出现 3 选 1 点选——点「选我」→「恭喜获得」→「开心收下」后进奖励商品页 → 点左上箭头回活动页。遇到时按此走，不要等旧弹窗；最终仍以第 7 步「奖励」记录验收。
    - 「邀好友抽福袋」或「抽福袋」（需组队）= 走第 6 步加入循环，成功后袋位翻成「立即抽福袋」再抽。
    - 「抽N个后开启」= 前面的袋抽完自然开启，回头再看。
 6. **抢码加入（核心，拼速度）**：每轮 ≤6 次尝试：
    ```
    R=$(curl -s "http://bz.5138zhuan.com/api.php?action=onekey")   # 404=池空，隔 5–10 秒重试
    NUM=<R 里的 number>
-   phone.py call shell '{"cmd":"am start --display <显示屏ID> -a android.intent.action.VIEW -d \"pinduoduo://com.xunmeng.pinduoduo/search_result.html?search_key=<NUM>\""}'
+   op13.py shell '{"cmd":"am start --display <显示屏ID> -a android.intent.action.VIEW -d \"pinduoduo://com.xunmeng.pinduoduo/search_result.html?search_key=<NUM>\""}'
    sleep 4
    vscreen.tap (540,1400)   # 「立即加入抽福袋」实测坐标（2026-10-27 本机 OCR 实测，见已知坑）
    sleep 3，取帧验收（本机 OCR 约 2 秒，验收必须做）；未生效再补点一次，不要预先连点两次
@@ -84,6 +85,17 @@
    - 若没有任何格子是「打卡」（今天已打过，如用户手动打过）→ 视为已完成，记日志即可。
      （2026-10-26 实测形态：周一第 1 天格金币带红勾 = 今日已打；高亮黑金币格是下一天、
      标「待打卡」，点它无反应，不要误当今日格反复点。）
+   - **改版兜底（2026-11-02 一加场实测后加）**：会员页已改版——当天格「打卡」pill 坐标
+     复核无误（bbox 134–206 × 1180–1217），但 vscreen/input 两种注入点下去都只把页面
+     滚到权益区、不打卡、积分不动（当时余额 1229）。遇此形态不要原地重复同一种点击，
+     按序换打法、每换一种都取新帧验收（格子变灰/高亮移位，或积分余额 +10）：
+     ① 点 pill 前先记下当前积分余额作对照；
+     ② 页面被滚到权益区后，在新位置整帧 OCR 找「打卡 / 签到」入口或当天格，若 pill
+        在新位置仍可见，在新位置再点一次；
+     ③ 点当天格子本体（金币图标/格面），而不是 pill；
+     ④ 三种都无效 → 按打卡失败汇报，并注明已试打法与滚后帧里看到的入口文案，
+        供下一轮改手册。（注：GT7 账号 2026-11-02 凌晨场用旧打法打卡成功、+10 积分，
+        说明改版可能是分账号灰度，一加失败不等于 GT7 失败，两边各自按帧验收。）
    - 找不到会员入口或点后未生效 → 记为打卡失败，汇报时带一句（不影响福袋本身的口径）。
 10. 收尾：`vscreen.close {}`。
 
@@ -107,6 +119,7 @@
   但回页后要重新 OCR 确认袋序——袋位会按状态重排，未抽的排最左）。另：抽中弹窗点「开心收下」(541,1634)
   实测会直接打开该券的奖励商品页（不是单纯关弹窗），同样左上箭头返回即可，券已入账不受影响。
   运行中手机多次息屏锁定（约每 3 分钟一次），取帧只剩时钟/日期时先 `lock.unlock` 再继续，勿误判页面。
+- **2026-11-06 GT7 新栈场导航注记**：消费券页按 BACK 有时被叠层面板吞掉一次（没退成再按一次，别误判页面卡死）；页顶面包屑文字不是导航键、点它无用；force-stop 后重拉拼多多会恢复到消费券页而非首页（与冷启动直达秒杀页的旧注记并存，以当帧为准）。
 - **2026-10-27 实测订正**：加入弹窗「立即加入抽福袋」按钮实测在 **(540,1400)**，单点一次即生效
   （袋2/袋3 各 1 轮成功）；旧盲点 (540,1453) 落在按钮下方，连点两下会多开一层我方队伍的
   「邀请好友抽福袋」弹窗（栈式叠加，后一层会残留并在关奖记录/回页时重现），关法 = 点弹窗右上
